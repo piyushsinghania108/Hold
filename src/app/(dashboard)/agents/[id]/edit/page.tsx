@@ -1,0 +1,70 @@
+import { notFound } from "next/navigation";
+import { prisma } from "@/lib/prisma";
+import { PageHeader } from "@/components/layout/page-header";
+import { AgentForm } from "@/components/forms/agent-form";
+
+export default async function EditAgentPage({
+  params,
+}: {
+  params: Promise<{ id: string }>;
+}) {
+  const { id } = await params;
+  const agent = await prisma.aIAgent.findUnique({ where: { id } });
+  if (!agent) notFound();
+
+  const [systems, users] = await Promise.all([
+    prisma.aISystem.findMany({ select: { id: true, name: true }, orderBy: { name: "asc" } }),
+    prisma.user.findMany({
+      where: { status: "ACTIVE" },
+      select: { id: true, name: true, email: true },
+      orderBy: { name: "asc" },
+    }),
+  ]);
+
+  return (
+    <div className="space-y-6">
+      <PageHeader
+        title={`Edit: ${agent.name}`}
+        description="Update agent configuration"
+      />
+      <AgentForm
+        initialData={{
+          id: agent.id,
+          name: agent.name,
+          description: agent.description,
+          aiSystemId: agent.aiSystemId,
+          capabilities: agent.capabilities as string[],
+          accessLevel: agent.accessLevel,
+          autonomyLevel: agent.autonomyLevel,
+          connectedSystems: agent.connectedSystems as string[],
+          humanReviewRequired: agent.humanReviewRequired,
+          riskLevel: agent.riskLevel,
+          status: agent.status,
+          department: agent.department,
+          mcpServerAllowlist: agent.mcpServerAllowlist,
+          mcpToolAllowlist: agent.mcpToolAllowlist,
+          mcpEnforcement: agent.mcpEnforcement,
+          purpose: agent.purpose,
+          inScopeActions: agent.inScopeActions,
+          outOfScopeActions: agent.outOfScopeActions,
+          decisionBoundaries: agent.decisionBoundaries,
+          successCriteria: agent.successCriteria,
+          requireOwnerApproval: agent.requireOwnerApproval,
+          requireSecurityApproval: agent.requireSecurityApproval,
+          requireLegalApproval: agent.requireLegalApproval,
+          requireComplianceApproval: agent.requireComplianceApproval,
+          reviewIntervalDays: agent.reviewIntervalDays,
+          humanReviewTriggers: agent.humanReviewTriggers,
+          humanReviewEnforcement: agent.humanReviewEnforcement,
+          technicalOwnerId: agent.technicalOwnerId,
+          riskOwnerId: agent.riskOwnerId,
+          escalationContact: agent.escalationContact,
+          inheritMcpCatalog: agent.inheritMcpCatalog,
+          scopeEnforcement: agent.scopeEnforcement,
+        }}
+        systems={systems}
+        users={users}
+      />
+    </div>
+  );
+}

@@ -1,0 +1,83 @@
+# Shadow AI Discovery
+
+Detect AI tools in use in your organization that are not yet in the Registry.
+
+## Discovery sources
+
+Four scanning sources, each independently configurable:
+
+- **Google Workspace** — scans OAuth activity logs for AI apps that users have connected.
+- **Microsoft 365** — scans delegated app permissions in your tenant against a known-AI-tools registry. Resolving who granted each permission to an email address needs `User.Read.All` on the scanning app; without it the tool is still discovered but its user list stays empty.
+- **Hexnode UEM** — reads the app inventory from managed devices, catching desktop and mobile apps that never touch an OAuth flow.
+- **CrowdStrike Falcon** — endpoint discovery, for AI tools observed running on protected hosts.
+
+Plus two import paths that need no live connection:
+
+- **DNS / proxy logs** — CSV or TXT upload, or JSON API ingestion, of network-observed AI domains. The importer reads native gateway exports: pick the vendor (Cisco Umbrella, Cloudflare Gateway, Zscaler, Netskope, Prisma Access, DNSFilter, NextDNS, or generic) and it maps that vendor's domain, user, department, count, and timestamp columns. Hostnames are normalized before matching, so `api.openai.com`, `openai.com.`, and mixed-case variants resolve to the same tool.
+- **Netskope** — a dedicated import for Netskope's cloud log shipper.
+
+The identity-based sources (Google, Microsoft) only see apps federated to your IdP. A tool someone signed into with a personal account is invisible to them and must be caught by device inventory or network logs — which is why the sources are complementary rather than redundant.
+
+**Agent platforms** is a fifth scheduled source that finds agents rather than tools: it imports agents from Anthropic Managed Agents, Microsoft 365 Copilot / Copilot Studio and Salesforce Agentforce into the agent review queue (**Agents → Discovered**). It is configured on the **Agent Platforms** card at the bottom of **Settings → Shadow AI**, where **Import Now** runs it on demand, and it is not part of **Scan All Sources**.
+
+## Observation details
+
+Each discovered tool records what the scans actually observed, shown under the tool name:
+
+- **First seen / Last seen** — the earliest and latest observation across every scan. Log imports use the export's own timestamp column when it has one (`timestamp`, `@timestamp`, `time`, `date`, and similar; ISO or epoch); otherwise the import time is used.
+- **Users** — the email addresses seen using the tool, as chips. Only real email addresses are kept; device names or bare usernames from network logs count toward the user total but are not listed.
+- **Departments** — when a directory sync is enabled (**Settings → Users & Identity**), the observed users are rolled up by their directory department, for example "Engineering 4 · Sales 2". Email aliases fold onto the same person first, and users with no directory match (or no department) are counted as unmatched.
+- **Data access** — for identity-provider sources, the OAuth scopes granted to the app are translated into one chip per kind of company data it can reach: Email, Files & docs, Calendar, Contacts, Chat & meetings, Directory, Admin, Cloud platform, each with the highest access level granted (read, read/write or full). Broad write access is amber and broad read is blue; sign-in-only identity scopes are outlined and never count as broad. Click a chip to filter the list to every tool with that access. Expand **N OAuth scopes** to see each scope's plain label with the raw scope value beneath it.
+
+The **user count** follows one rule: a rescan from the **same** source replaces the count, so it can go down when access is revoked or devices are retired; a **different** source only ever raises it, so two partial views combine as a maximum rather than overwriting each other.
+
+## Filtering by data access
+
+The **By Category** card has a **Data access** row (one button per kind of access seen, with a count) and an **Access** dropdown. Pick one to show only tools whose granted scopes reach that data — for example every app that can read mail or write to Drive. The access filter combines with the category filter, and **Clear filter** resets both. Tools from sources that do not report OAuth scopes (DNS and proxy logs, endpoint agent, manual reports) never match an access filter.
+
+## Tool categories
+
+Every tool in the known-AI-tools registry (160+ entries) carries a category, and a discovery inherits it when it matches the registry. The categories are a fixed set: Chat Assistant, Coding Assistant, Agent Platform, Image Generation, Video Generation, Audio & Voice, Writing, Meeting Notes, Search & Research, ML Platform, Data Analysis, Productivity, Translation, Customer Support, Browser Extension, and Other.
+
+- Each discovered tool shows a **category badge** beside its name. Tools that matched nothing in the registry (heuristic `.ai` candidates, manual reports of unknown tools) show **Uncategorized**.
+- The **By Category** panel counts discoveries per category across the whole page. Click a category chip, or use the **Filter** select, to narrow every section to one category; **Uncategorized** is its own filter.
+- On a **Needs Review** card the **Category** select changes the category by hand — for a tool the registry does not know, or one it classified in a way that does not fit how your organization uses it. Changes are audit-logged.
+- Existing discoveries from before categories were introduced are filled in on the next scan or import that sees them, or all at once by an administrator running the backfill script.
+
+## Confidence scoring
+
+Every discovered tool is assigned a match confidence based on how it was identified:
+
+- **High** (score 10+) — strong match via domain + name or multiple signals.
+- **Medium** (score 6–9) — partial match via name or publisher only.
+- **Low** (score < 6) — heuristic match via AI keywords (e.g. ".ai" domain, "gpt", "copilot") but no known registry entry, or a fuzzy name match on its own.
+
+Names from app inventories and OAuth grants are matched to the registry loosely as well as exactly. A **fuzzy** match ignores case, punctuation and filler words ("AI", "Inc", "the"), allows one typo in a word of five or more letters, and tolerates split or hyphenated names — so "Perplexty", "mid journey" and "Github Co-pilot" resolve to Perplexity, Midjourney and GitHub Copilot. A fuzzy hit scores less than an exact name (4 versus 6) and is recorded as a `fuzzy_name:` reason on the discovery so reviewers can see what was inferred. A vendor name on its own ("Google", "Microsoft") is never treated as a tool match.
+
+## Page sections
+
+The page splits discoveries into three sections:
+
+- **Needs Review** — high-confidence matches and legacy tools. These are confirmed AI tools that need a governance decision. **Review** (or **Start triage** for the first in the queue) opens a guided review: what was found, three questions (data exposure, business need, approved alternative), then a suggested outcome. You register, approve, block or dismiss, with a reason that goes in the audit log, then move to the next tool. The quick actions (**Convert to Governed System**, **Register & Assess**, **Approve**, **Block**, **Dismiss**) are still on each row.
+- **Low-Confidence Candidates** — medium and low-confidence matches. Each shows a confidence badge, score, and match reasons. Actions: **Promote** (move to main queue as high-confidence) or **Dismiss** (permanently suppress with a reason).
+- **Resolved** — tools that have been registered, approved, or blocked.
+
+## Scan triggers
+
+- **Manual**: click **Scan All Sources**. Every configured source runs; unconfigured ones are skipped cleanly and reported as such, so it is always clear which sources actually ran.
+- **Automatic**: configured in **Settings → Shadow AI** (cron fires hourly; each source checks its own interval). The agent platform import has its own **Auto-import** toggle and interval on the Agent Platforms card.
+
+## What "Block" actually does
+
+Blocking records the decision in Hold and takes effect through up to three enforcement layers:
+
+- **In-path** — the network proxy (`/api/proxy/net/<host>/<path>`, Settings → Proxy Setup) denies every blocked tool's domain and subdomains automatically: `403` in Enforce mode, a logged would-block in Monitor mode, nothing when the proxy is Off. The block/unblock notice says which applies, and each blocked tool shows how many requests the proxy denied in the last 30 days.
+
+- **Network** — blocked domains are published on an authenticated feed at `/api/discovered-tools/blocklist`, which a DNS sinkhole, proxy ACL, firewall URL list, or CASB polls to enforce. Formats: `text` (default), `hosts`, `json`, and `pac`, selected with `?format=`. The feed requires a Bearer token and fails closed — with no token configured it returns 503 rather than serving unauthenticated. Set the token in **Settings → Shadow AI**.
+- **Identity** — where the tool is federated to Google Workspace or Microsoft 365 and the scan captured an app handle, blocking disables the app at the identity provider so sign-ins stop. Tools discovered without an app handle report `skipped`; a provider missing the required admin permission reports `failed`.
+
+Check **Settings → Shadow AI** for a readiness summary of all layers. A blocked tool with no layer armed is a documented decision, not an enforced one.
+
+## Automatic suppression
+
+Discoveries whose name (and vendor, when present) match an existing Registry system are auto-linked and suppressed. Dismissed candidates are also suppressed — the scanner checks the dismissed list before creating new records.

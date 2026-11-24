@@ -1,0 +1,2547 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  // DIRECT_URL bypasses the PgBouncer pooler (port 5432 instead of 6432) for
+  // prisma migrate / db pull / introspection, which need session-level semantics
+  // that transaction-pool mode doesn't support. Falls back to DATABASE_URL in dev.
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── Enums ──────────────────────────────────────────────
+
+enum Role {
+  ADMIN
+  COMPLIANCE_OFFICER
+  VIEWER
+}
+
+// Account lifecycle. Only ACTIVE users can hold a session — SUSPENDED is
+// reversible, DELETED is terminal and has had its identifying fields scrubbed.
+// Rows are never removed, so audit logs and governance evidence keep a stable
+// (if anonymized) actor.
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum RiskLevel {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+  MINIMAL
+}
+
+enum AISystemStatus {
+  DRAFT
+  UNDER_REVIEW
+  APPROVED
+  DEPLOYED
+  DEPRECATED
+  RETIRED
+}
+
+enum ComplianceStatus {
+  COMPLIANT
+  PARTIALLY_COMPLIANT
+  NON_COMPLIANT
+  NOT_ASSESSED
+}
+
+enum AlertSeverity {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+  INFO
+}
+
+enum AlertStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+  DISMISSED
+}
+
+enum DataSensitivity {
+  PUBLIC
+  INTERNAL
+  CONFIDENTIAL
+  RESTRICTED
+}
+
+enum PolicyStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+enum DiscoveryStatus {
+  DISCOVERED
+  UNDER_REVIEW
+  REGISTERED
+  BLOCKED
+  APPROVED
+}
+
+enum AutonomyLevel {
+  FULL_AUTONOMY
+  SUPERVISED
+  HUMAN_IN_THE_LOOP
+  HUMAN_ON_THE_LOOP
+  MANUAL
+}
+
+enum ComplianceFramework {
+  EU_AI_ACT
+  NIST_AI_RMF
+  ISO_42001
+  SOC2
+  COLORADO_AI
+  NEW_YORK_AI
+  CUSTOM
+}
+
+enum EuAiActRiskTier {
+  PROHIBITED
+  HIGH_RISK
+  LIMITED_RISK
+  MINIMAL_RISK
+}
+
+enum EuAiActRole {
+  PROVIDER
+  DEPLOYER
+  PROVIDER_AND_DEPLOYER
+}
+
+enum ProviderSyncStatus {
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+enum ApprovalDecision {
+  APPROVED
+  CHANGES_REQUESTED
+  REVOKED
+}
+
+enum GovernanceReviewStage {
+  OWNER
+  SECURITY
+  LEGAL
+  COMPLIANCE
+}
+
+enum GovernanceExceptionStatus {
+  ACTIVE
+  EXPIRED
+  REVOKED
+}
+
+enum HumanReviewStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  EXPIRED
+  CONSUMED
+}
+
+enum VendorContractStatus {
+  UNKNOWN
+  IN_REVIEW
+  ACTIVE
+  EXPIRED
+  TERMINATED
+}
+
+enum VendorReviewStatus {
+  NOT_REVIEWED
+  IN_PROGRESS
+  APPROVED
+  CONDITIONAL
+  REJECTED
+}
+
+enum VendorAssessmentStatus {
+  IN_PROGRESS
+  COMPLETED
+}
+
+enum RiskIssueStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+  ACCEPTED
+}
+
+enum InvestigationStatus {
+  OPEN
+  IN_PROGRESS
+  RESOLVED
+}
+
+enum BudgetScopeType {
+  PROVIDER
+  AI_SYSTEM
+  DEPARTMENT
+}
+
+// ─── Auth (NextAuth) ────────────────────────────────────
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String? @db.Text
+  access_token      String? @db.Text
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String? @db.Text
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+// ─── User ───────────────────────────────────────────────
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  passwordHash  String?   @db.Text
+  role          Role      @default(VIEWER)
+  department    String?
+
+  status       UserStatus @default(ACTIVE)
+  statusReason String?    @db.Text
+  suspendedAt  DateTime?
+  deletedAt    DateTime?
+
+  accounts     Account[]
+  sessions     Session[]
+  ownedSystems AISystem[]    @relation("SystemOwner")
+  ownedAgents  AIAgent[]     @relation("AgentOwner")
+  suspendedAgents AIAgent[]  @relation("AgentSuspendedBy")
+  agentApprovals         AgentApproval[]
+  agentGovernanceReviews AgentGovernanceReview[]
+  technicalOwnedAgents   AIAgent[] @relation("AgentTechnicalOwner")
+  riskOwnedAgents        AIAgent[] @relation("AgentRiskOwner")
+  retiredAgents          AIAgent[] @relation("AgentRetiredBy")
+  networkRules           NetworkBlockRule[]
+  mcpCatalogApprovals    McpCatalogEntry[] @relation("McpCatalogApprovedBy")
+  toolClassifications    ToolClassification[] @relation("ToolClassificationCreatedBy")
+  humanReviewDecisions   HumanReviewRequest[] @relation("HumanReviewDecidedBy")
+  apiUsageLogs APIUsageLog[]
+  auditLogs    AuditLog[]
+  syncRuns     ProviderSyncRun[]
+  ingestionRuns IngestionRun[]
+  systemApprovals SystemApproval[]
+  governanceReviews GovernanceReview[]
+  governanceExceptions GovernanceException[]
+  evidenceArtifacts EvidenceArtifact[]
+  euAiActClassifications EuAiActClassification[] @relation("EuAiActClassifiedBy")
+  governanceIncidents GovernanceIncident[]
+  investigations Investigation[]      @relation("InvestigationOwner")
+  spendBudgets SpendBudget[]          @relation("SpendBudgetOwner")
+  falsePositiveAlerts Alert[]          @relation("AlertFalsePositiveBy")
+  promptRiskExceptions PromptRiskException[] @relation("PromptRiskExceptionCreator")
+  dismissedCandidates DismissedCandidate[] @relation("DismissedCandidateBy")
+  reportDefinitions   ReportDefinition[] @relation("ReportDefinitionOwner")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── AI System Registry ─────────────────────────────────
+
+model AISystem {
+  id              String          @id @default(cuid())
+  name            String
+  description     String?         @db.Text
+  version         String?
+  owner           User            @relation("SystemOwner", fields: [ownerId], references: [id])
+  ownerId         String
+  department      String
+  riskLevel       RiskLevel       @default(MEDIUM)
+  status          AISystemStatus  @default(DRAFT)
+  useCase         String?         @db.Text
+  dataSensitivity DataSensitivity @default(INTERNAL)
+  vendor          String?
+  modelType       String?
+  dataInputs      String?         @db.Text
+  dataOutputs     String?         @db.Text
+  reviewIntervalDays Int          @default(365)
+  nextReviewDate  DateTime?
+  requireOwnerApproval Boolean    @default(true)
+  requireSecurityApproval Boolean @default(true)
+  requireLegalApproval Boolean    @default(false)
+  requireComplianceApproval Boolean @default(true)
+
+  complianceMappings ComplianceMapping[]
+  euAiActClassification EuAiActClassification?
+  riskAssessments    RiskAssessment[]
+  policyAssignments  PolicyAssignment[]
+  approvals          SystemApproval[]
+  governanceReviews  GovernanceReview[]
+  governanceExceptions GovernanceException[]
+  evidenceArtifacts  EvidenceArtifact[]
+  governanceIncidents GovernanceIncident[]
+  alerts             Alert[]
+  investigations     Investigation[]
+  agents             AIAgent[]
+  auditLogs          AuditLog[]       @relation("SystemAuditLogs")
+  usageBuckets       UsageBucket[]
+  costBuckets        CostBucket[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ─── AI Agent Registry ──────────────────────────────────
+
+model AIAgent {
+  id                  String         @id @default(cuid())
+  name                String
+  description         String?        @db.Text
+  aiSystem            AISystem?      @relation(fields: [aiSystemId], references: [id])
+  aiSystemId          String?
+  owner               User           @relation("AgentOwner", fields: [ownerId], references: [id])
+  ownerId             String
+  capabilities        Json           @default("[]")
+  accessLevel         String         @default("read-only")
+  autonomyLevel       AutonomyLevel  @default(HUMAN_IN_THE_LOOP)
+  connectedSystems    Json           @default("[]")
+  humanReviewRequired Boolean        @default(true)
+  // Structured triggers (src/lib/human-review-triggers.ts). Both proxies
+  // evaluate them against the arguments of every tool call the model makes.
+  // "monitor" records a dry-run denial + alert; "enforce" withholds the
+  // response (403 human_review_required) when a trigger matches.
+  humanReviewTriggers    Json?
+  humanReviewEnforcement String @default("monitor")
+  riskLevel           RiskLevel      @default(MEDIUM)
+  status              AISystemStatus @default(DRAFT)
+  department          String?
+
+  // Charter — defined before the agent is approved (docs/plans/agentic-governance-playbook.md §2).
+  purpose            String?  @db.Text
+  inScopeActions     String[] @default([])
+  outOfScopeActions  String[] @default([])
+  decisionBoundaries String?  @db.Text
+  successCriteria    String?  @db.Text
+
+  // Approval gate: which stage sign-offs are required before approval, and the
+  // review cadence. Mirrors AISystem so the same reviewer UI serves both.
+  requireOwnerApproval      Boolean  @default(true)
+  requireSecurityApproval   Boolean  @default(true)
+  requireLegalApproval      Boolean  @default(false)
+  requireComplianceApproval Boolean  @default(true)
+  reviewIntervalDays        Int      @default(365)
+  nextReviewDate            DateTime?
+
+  // Accountability (playbook: responsibility split across business,
+  // technology and risk roles, plus an escalation path). `owner` is the
+  // business owner.
+  technicalOwner    User?   @relation("AgentTechnicalOwner", fields: [technicalOwnerId], references: [id], onDelete: SetNull)
+  technicalOwnerId  String?
+  riskOwner         User?   @relation("AgentRiskOwner", fields: [riskOwnerId], references: [id], onDelete: SetNull)
+  riskOwnerId       String?
+  /// Who to page when a review trigger fires or an incident opens (email, Slack channel, pager).
+  escalationContact String?
+
+  // Retirement — controlled shutdown. Set by POST /api/agents/[id]/retire,
+  // which also revokes the approval; the proxy refuses RETIRED agents.
+  retiredAt          DateTime?
+  retiredBy          User?     @relation("AgentRetiredBy", fields: [retiredById], references: [id], onDelete: SetNull)
+  retiredById        String?
+  retirementNotes    String?   @db.Text
+  /// Operator attests that data, credentials and model artifacts were disposed of.
+  retirementAttested Boolean   @default(false)
+
+  // MCP tool governance. Empty allowlists mean "observe only". Entries:
+  // servers match the declared name or URL host (wildcards allowed); tools are
+  // "tool", "server/tool" or "server/*". `mcpEnforcement` is "monitor"
+  // (record + alert) or "enforce" (proxy blocks unlisted servers and narrows
+  // allowed_tools before forwarding).
+  mcpServerAllowlist String[] @default([])
+  mcpToolAllowlist   String[] @default([])
+  mcpEnforcement     String   @default("monitor")
+  // When true the org-wide approved catalog (McpCatalogEntry) is merged into
+  // this agent's allowlists at the proxy. Existing agents default to false so
+  // adding the first catalog entry never changes their behaviour; new agents
+  // inherit by default (validation schema).
+  inheritMcpCatalog  Boolean  @default(false)
+  // Charter scope enforcement (src/lib/agent-scope.ts). Both proxies classify
+  // every tool call (ToolClassification rules, else a name heuristic) and
+  // compare it with `accessLevel` and `connectedSystems`. "monitor" records a
+  // dry-run denial + alert; "enforce" withholds the response (403
+  // agent_scope_violation). Never queued for review — the charter is changed,
+  // not waived.
+  scopeEnforcement   String   @default("monitor")
+
+  // Kill switch. While `suspendedAt` is set both proxies refuse requests that
+  // carry this agent's x-agent-id (403, recorded as an enforced PolicyDenial).
+  // RETIRED agents are refused the same way. See src/lib/agent-runtime-gate.ts.
+  suspendedAt     DateTime?
+  suspendedBy     User?     @relation("AgentSuspendedBy", fields: [suspendedById], references: [id], onDelete: SetNull)
+  suspendedById   String?
+  suspendedReason String?   @db.Text
+
+  auditLogs    AuditLog[]        @relation("AgentAuditLogs")
+  riskReviews  AgentRiskReview[]
+  approvals         AgentApproval[]
+  governanceReviews AgentGovernanceReview[]
+  incidents         GovernanceIncident[]
+  behaviorBaseline  AgentBehaviorBaseline?
+  humanReviewRequests HumanReviewRequest[]
+  toolCalls    AgentToolCall[]
+  toolProfiles AgentToolProfile[]
+  discoveries  DiscoveredAgent[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// Org-wide approved MCP servers (and optionally tools) that agents with
+// `inheritMcpCatalog` pick up at the proxy. Same pattern grammar as the
+// per-agent allowlists; see mergeCatalogIntoConfig() in mcp-tool-governance.ts.
+model McpCatalogEntry {
+  id           String   @id @default(cuid())
+  /// Server name, host, URL or wildcard pattern.
+  server       String   @unique
+  /// Tool names allowed on this server; empty = every tool.
+  tools        String[] @default([])
+  label        String?
+  notes        String?  @db.Text
+  active       Boolean  @default(true)
+  approvedBy   User?    @relation("McpCatalogApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedById String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([active])
+}
+
+// Org-wide tool classification: what a tool does (read / write / admin) and
+// which business system it reaches. Both proxies match every tool call against
+// these rules (server/tool globs, most specific wins; `*` any server, `-` only
+// tools with no server) and fall back to a name heuristic. Drives charter
+// scope enforcement (src/lib/agent-scope.ts).
+model ToolClassification {
+  id          String   @id @default(cuid())
+  server      String   @default("*")
+  tool        String
+  /// "read" | "write" | "admin"
+  access      String
+  /// Business system the tool reaches; compared with AIAgent.connectedSystems.
+  system      String?
+  notes       String?  @db.Text
+  createdBy   User?    @relation("ToolClassificationCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([server, tool])
+}
+
+// Per-agent behavioural baseline over a trailing window, plus the drift
+// findings from the latest evaluation. Computed by /api/cron/agent-baselines
+// (daily) and on demand; see src/lib/agent-baseline.ts.
+model AgentBehaviorBaseline {
+  id              String   @id @default(cuid())
+  agent           AIAgent  @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  agentId         String   @unique
+  windowDays      Int      @default(28)
+  activeDays      Int      @default(0)
+  computedAt      DateTime
+  /// AgentBaselineStats
+  stats           Json
+  lastEvaluatedAt DateTime?
+  /// DriftFinding[] from the latest evaluation
+  lastFindings    Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+}
+
+// A tool call withheld by a human-review trigger (enforce mode), waiting for
+// a reviewer. Approving records a waiver (exact call, or any call matching
+// the trigger) that both proxies honour when the agent re-runs the call.
+// See src/lib/human-review-queue.ts. Mirrored in ai-proxy (WRITE model).
+model HumanReviewRequest {
+  id            String            @id @default(cuid())
+  agent         AIAgent           @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  agentId       String
+  status        HumanReviewStatus @default(PENDING)
+  provider      String
+  model         String?
+  /// sha256 over the withheld calls (tool + canonical arguments); identical re-runs collapse.
+  fingerprint   String
+  /// Trigger labels that matched, for scope "trigger" waivers.
+  triggers      String[]          @default([])
+  /// [{ tool, kind, trigger, detail, input }] — input is canonical JSON, truncated.
+  calls         Json
+  occurrences   Int               @default(1)
+  firstSeenAt   DateTime          @default(now())
+  lastSeenAt    DateTime          @default(now())
+  requestId     String?
+  userEmail     String?
+  department    String?
+  decidedBy     User?             @relation("HumanReviewDecidedBy", fields: [decidedById], references: [id], onDelete: SetNull)
+  decidedById   String?
+  decidedAt     DateTime?
+  decisionNote  String?           @db.Text
+  /// "exact" (same tool + arguments) | "trigger" (any call matching the same trigger)
+  waiverScope   String?
+  expiresAt     DateTime?
+  usesRemaining Int?
+  lastWaivedAt  DateTime?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  @@index([agentId, status, createdAt])
+  @@index([status, createdAt])
+  @@index([agentId, fingerprint, status])
+}
+
+// Agent-scoped twins of SystemApproval / GovernanceReview. Kept separate rather
+// than making those tables polymorphic so every existing `aiSystem` include and
+// notification stays non-nullable.
+model AgentApproval {
+  id              String           @id @default(cuid())
+  agent           AIAgent          @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  agentId         String
+  decidedByUser   User             @relation(fields: [decidedByUserId], references: [id], onDelete: Cascade)
+  decidedByUserId String
+  decision        ApprovalDecision
+  rationale       String?          @db.Text
+  createdAt       DateTime         @default(now())
+
+  @@index([agentId, createdAt])
+  @@index([decidedByUserId, createdAt])
+}
+
+model AgentGovernanceReview {
+  id              String                @id @default(cuid())
+  agent           AIAgent               @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  agentId         String
+  stage           GovernanceReviewStage
+  decidedByUser   User                  @relation(fields: [decidedByUserId], references: [id], onDelete: Cascade)
+  decidedByUserId String
+  approved        Boolean               @default(false)
+  rationale       String?               @db.Text
+  createdAt       DateTime              @default(now())
+
+  @@index([agentId, stage, createdAt])
+  @@index([decidedByUserId, createdAt])
+}
+
+// ─── Agent Discovery ────────────────────────────────────
+// An AI agent observed somewhere (proxy traffic, an agent platform's API, an
+// endpoint's MCP config) that may not be in the registry yet. Separate from
+// DiscoveredAITool because an agent carries tools, MCP servers, models and a
+// promotion target. Every source writes through upsertDiscoveredAgent() in
+// src/lib/agent-discovery.ts. See docs/plans/agent-discovery.md.
+model DiscoveredAgent {
+  id          String  @id @default(cuid())
+  /// "proxy_traffic" | "anthropic_managed_agents" | "microsoft_copilot" |
+  /// "salesforce_agentforce" | "openai_assistants" | "openai_agents" |
+  /// "chatgpt_gpts" | "endpoint_agent"
+  source      String
+  /// Stable identity within the source: platform id, caller fingerprint, or
+  /// device + client + server hash.
+  externalId  String
+  name        String
+  description String? @db.Text
+  /// Human label for where the agent runs, e.g. "Copilot Studio".
+  platform    String?
+  /// Agent framework / SDK detected from the client, e.g. "langgraph".
+  framework   String?
+
+  status     DiscoveryStatus @default(DISCOVERED)
+  /// "high" | "medium" | "low"
+  confidence String?
+  score      Int?
+  /// [{ key, label, weight }] — why this was flagged as an agent.
+  signals    Json            @default("[]")
+
+  tools      String[] @default([])
+  mcpServers String[] @default([])
+  models     String[] @default([])
+  userEmails String[] @default([])
+  ownerEmail String?
+  department String?
+
+  aiSystemId    String?
+  linkedAgent   AIAgent? @relation(fields: [linkedAgentId], references: [id], onDelete: SetNull)
+  linkedAgentId String?
+
+  requestCount Int       @default(0)
+  firstSeenAt  DateTime?
+  lastSeenAt   DateTime?
+  /// Source-specific detail (platform ids, environment, device ids). Never
+  /// content, secrets, commands or file paths.
+  metadata     Json?
+  notes        String?   @db.Text
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([source, externalId])
+  @@index([status, lastSeenAt])
+  @@index([linkedAgentId])
+}
+
+// ─── Shadow AI Discovery ────────────────────────────────
+
+model DiscoveredAITool {
+  id              String          @id @default(cuid())
+  toolName        String
+  vendor          String?
+  detectedDomain  String?
+  detectionSource String          @default("manual")
+  detectedAt      DateTime        @default(now())
+  status          DiscoveryStatus @default(DISCOVERED)
+  department      String?
+  userCount       Int             @default(0)
+  linkedSystemId  String?
+  notes           String?         @db.Text
+
+  matchConfidence String?         // "high", "medium", or "low"
+  matchScore      Int?            // numeric score from resolveAIToolMatch
+  matchReasons    Json?           // array of reason strings
+
+  // Registry category (AIToolCategory in src/lib/ai-tools-registry.ts), set
+  // from the registry match on create and backfilled when null. Editable by
+  // reviewers via PUT /api/discovered-tools/[id]. Null for heuristic-only
+  // discoveries that match nothing in the registry.
+  category        String?
+
+  // Identity-provider app handle captured at scan time, used to target
+  // identity-layer enforcement (revoke/disable the app's SSO access).
+  // externalAppProvider: "google_workspace" | "microsoft_365".
+  // externalAppId: Google OAuth client_id, or Entra servicePrincipal object id.
+  externalAppId       String?
+  externalAppProvider String?
+
+  // Observation detail captured by discovery scans. Previously these were
+  // stringified into `notes`; now they are queryable.
+  // userEmails: distinct users seen using the tool (from the most recent
+  //   scan of `detectionSource`). Empty when the source has no identity.
+  // scopes: OAuth scopes granted (identity-provider sources only).
+  // firstSeenAt / lastSeenAt: earliest and latest observation across scans.
+  userEmails  String[]  @default([])
+  scopes      String[]  @default([])
+  firstSeenAt DateTime?
+  lastSeenAt  DateTime?
+
+  alerts Alert[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([toolName, detectedDomain])
+  @@index([status, matchConfidence])
+  @@index([externalAppProvider, externalAppId])
+  @@index([lastSeenAt])
+  @@index([category])
+}
+
+model DismissedCandidate {
+  id              String   @id @default(cuid())
+  toolName        String
+  vendor          String?
+  detectedDomain  String?
+  reason          String   @db.Text
+  dismissedByUser User     @relation("DismissedCandidateBy", fields: [dismissedByUserId], references: [id])
+  dismissedByUserId String
+  createdAt       DateTime @default(now())
+
+  @@unique([toolName, detectedDomain])
+  @@index([dismissedByUserId])
+}
+
+// ─── Scan History ───────────────────────────────────────
+
+model ScanHistory {
+  id            String    @id @default(cuid())
+  scanType      String    @default("google_workspace")
+  status        String    @default("running")
+  toolsFound    Int       @default(0)
+  newToolsAdded Int       @default(0)
+  updatedTools  Int       @default(0)
+  errorMessage  String?   @db.Text
+  triggeredBy   String
+  startedAt     DateTime  @default(now())
+  completedAt   DateTime?
+  createdAt     DateTime  @default(now())
+}
+
+// ─── Endpoint Agent ─────────────────────────────────────
+// A machine running the UrNammu endpoint agent. Observes AI activity from
+// inside the endpoint — installed/running AI apps, allowlisted AI hostnames
+// from browser history and the DNS cache, and local inference runtimes —
+// covering the machines every network- and SaaS-side source goes blind on
+// (off-VPN laptops, personal-tier accounts, desktop apps, local models).
+//
+// The agent never reports content: no prompts, no responses, no URL paths,
+// no window titles. Only which tool, how often, and when. See
+// docs/plans/endpoint-agent.md.
+model EndpointDevice {
+  id           String @id @default(cuid())
+  // Stable machine identifier chosen by the agent (macOS IOPlatformUUID /
+  // Windows MachineGuid). Unique so a re-install re-enrolls in place rather
+  // than forking a second device row.
+  machineId    String @unique
+  hostname     String
+  // "darwin" | "windows"
+  platform     String
+  osVersion    String?
+  arch         String?
+  agentVersion String?
+
+  // Console user at enrollment. Matched to DirectoryPerson/User by email
+  // where possible; kept as free text when the machine is shared or unjoined.
+  userEmail String?
+  userName  String?
+
+  // SHA-256 of the per-device bearer token. The plaintext is returned exactly
+  // once, at enrollment, and never stored — a leaked DB cannot forge reports.
+  tokenHash     String
+  // Bumped on re-enrollment, which invalidates the previous token.
+  tokenIssuedAt DateTime @default(now())
+
+  // ACTIVE — reporting normally.
+  // STALE   — no report within the staleness window (set by the cron sweep).
+  // REVOKED — token rejected; the agent stops reporting and will not
+  //           re-enroll on its own.
+  status       String    @default("ACTIVE")
+  statusReason String?   @db.Text
+
+  enrolledAt   DateTime  @default(now())
+  // Last authenticated request of any kind (report or manifest fetch).
+  lastSeenAt   DateTime?
+  // Last accepted report — the one that matters for "is this device covered".
+  lastReportAt DateTime?
+
+  // Per-collector health from the most recent report, so the UI can say
+  // "Safari skipped: no Full Disk Access" instead of silently under-reporting.
+  collectorStatus Json?
+
+  detections EndpointDetection[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status, lastReportAt])
+  @@index([userEmail])
+  @@index([platform])
+}
+
+// One (device, signal, tool, evidence) observation, merged on repeat: the
+// table grows with the fleet and its tool surface, not with time.
+model EndpointDetection {
+  id       String         @id @default(cuid())
+  device   EndpointDevice @relation(fields: [deviceId], references: [id], onDelete: Cascade)
+  deviceId String
+
+  // Which collector saw it: "app" | "browser" | "network" | "runtime".
+  signal String
+  // Registry tool name when matched, else the raw observed name.
+  toolName String
+  vendor   String?
+  // AIToolCategory from the registry; null for unmatched observations.
+  category String?
+  // From resolveAIToolMatch: "high" | "medium" | "low".
+  matchConfidence String?
+
+  // What was actually seen, normalized per signal: bundle id or image name
+  // (app), hostname (browser/network), runtime id + port (runtime). Non-null
+  // and part of the merge key — Postgres treats NULLs as distinct, which
+  // would defeat the unique index.
+  evidence String @default("")
+  // Collector-specific extras (app version, publisher, browser, local model
+  // names). Never content.
+  detail   Json?
+
+  // Observation weight: launch count, visit count, DNS hit count. Summed
+  // across reports.
+  observations Int      @default(0)
+  firstSeenAt  DateTime
+  lastSeenAt   DateTime
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([deviceId, signal, toolName, evidence])
+  @@index([toolName, lastSeenAt])
+  @@index([signal, lastSeenAt])
+  @@index([lastSeenAt])
+}
+
+// ─── Provider Security & Privacy Posture Scan ───────────
+// Audits how each configured AI provider is wired for secure use and privacy:
+// local config hygiene (proxy secret, TLS endpoints, credentials), vendor
+// governance facts (security review, data residency, subprocessors, contract),
+// known-provider privacy defaults (training-on-data, ZDR), plus best-effort
+// live verification against provider admin APIs. Higher score = better posture.
+model ProviderSecurityScan {
+  id               String                   @id @default(cuid())
+  status           String                   @default("running") // running | completed | failed
+  providersScanned Int                      @default(0)
+  findingsFound    Int                      @default(0) // failed checks across all providers
+  criticalCount    Int                      @default(0) // failed CRITICAL/HIGH checks
+  errorMessage     String?                  @db.Text
+  triggeredBy      String
+  startedAt        DateTime                 @default(now())
+  completedAt      DateTime?
+  createdAt        DateTime                 @default(now())
+  results          ProviderSecurityResult[]
+}
+
+model ProviderSecurityResult {
+  id                 String   @id @default(cuid())
+  provider           String // anthropic | openai | gemini | openrouter | helicone | portkey | litellm | cursor
+  overallScore       Float    @default(0) // 0-100, higher = better posture
+  grade              String   @default("F") // A | B | C | D | F
+  dataHandlingScore  Float    @default(0)
+  retentionScore     Float    @default(0)
+  trainingUseScore   Float    @default(0)
+  encryptionScore    Float    @default(0)
+  accessControlScore Float    @default(0)
+  residencyScore     Float    @default(0)
+  liveChecksRan      Boolean  @default(false) // a live API read contributed to this result
+  checks             Json // full per-check outcomes (status, severity, verification, remediation)
+  scan               ProviderSecurityScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  scanId             String
+  createdAt          DateTime @default(now())
+
+  @@index([scanId])
+  @@index([provider])
+}
+
+// ─── Sensitive-Information Scanning ─────────────────────
+// Active leakage probing of the live, reachable AI endpoints (LiteLLM, the
+// active provider, Portkey-if-routable) plus inline DLP on model responses.
+// Only sanitized excerpts are ever persisted here.
+
+model SensitiveScan {
+  id            String             @id @default(cuid())
+  status        String             @default("running") // running | completed | failed
+  targetsProbed Int                @default(0)
+  findingsFound Int                @default(0)
+  criticalCount Int                @default(0)
+  errorMessage  String?            @db.Text
+  triggeredBy   String
+  startedAt     DateTime           @default(now())
+  completedAt   DateTime?
+  createdAt     DateTime           @default(now())
+  findings      SensitiveFinding[]
+  probeResults  SensitiveProbeResult[]
+}
+
+// One row per (target, probe) in a scan: what the model actually answered the
+// bait prompt with, flagged or not. Lets reviewers read the refusals behind a
+// clean result and the exact text behind a finding. The response is stored
+// sanitized (emails, long numbers, tokens, SSNs and cards redacted) and
+// truncated, never raw. Deleted with its scan (retention cron cascades).
+model SensitiveProbeResult {
+  id              String        @id @default(cuid())
+  scan            SensitiveScan @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  scanId          String
+  targetId        String // active_provider | litellm | portkey
+  targetLabel     String
+  model           String?
+  probeId         String
+  probeLabel      String
+  status          String // "probed" | "error"
+  responseExcerpt String?       @db.Text // sanitized, ≤2000 chars
+  responseLength  Int           @default(0) // raw character count before truncation
+  flagged         Boolean       @default(false)
+  severity        String? // "critical" | "warning" when flagged
+  categories      String[]
+  findingId       String?
+  errorMessage    String?       @db.Text
+  createdAt       DateTime      @default(now())
+
+  @@index([scanId])
+}
+
+model SensitiveFinding {
+  id             String         @id @default(cuid())
+  source         String // "probe" | "response_dlp"
+  provider       String
+  model          String?
+  probeLabel     String?
+  severity       String // "critical" | "warning"
+  ruleKeys       String[]
+  categories     String[]
+  matchedSignals String[] // sanitized
+  excerpt        String?        @db.Text // sanitized, ≤220 chars
+  aiSystemId     String?
+  apiUsageLogId  String?
+  alertId        String?
+  scan           SensitiveScan? @relation(fields: [scanId], references: [id], onDelete: Cascade)
+  scanId         String?
+  createdAt      DateTime       @default(now())
+
+  @@index([source, createdAt])
+  @@index([scanId])
+}
+
+// ─── App Settings (key-value store) ─────────────────────
+
+model AppSetting {
+  key       String   @id
+  value     String   @db.Text
+  updatedAt DateTime @updatedAt
+  createdAt DateTime @default(now())
+}
+
+model VendorProfile {
+  id                    String               @id @default(cuid())
+  vendor                String               @unique
+  contractStatus        VendorContractStatus @default(UNKNOWN)
+  contractOwner         String?
+  contractStartDate     DateTime?
+  contractRenewalDate   DateTime?
+  renewalNoticeDays     Int                  @default(60)
+  renewalNotes          String?              @db.Text
+  securityReviewStatus  VendorReviewStatus   @default(NOT_REVIEWED)
+  website               String?
+  description           String?              @db.Text
+  dataResidency         Json?
+  approvedUseCases      Json?
+  subprocessors         Json?
+  notes                 String?              @db.Text
+  assessments           VendorAssessment[]
+  createdAt             DateTime             @default(now())
+  updatedAt             DateTime             @updatedAt
+
+  @@index([vendor])
+}
+
+// Vendor-level security & data-handling questionnaire. Answers are saved per
+// wizard section while IN_PROGRESS; score/tier are computed on completion by
+// src/lib/vendor-questionnaire.ts and the completing reviewer's decision is
+// written back to VendorProfile.securityReviewStatus.
+model VendorAssessment {
+  id              String                 @id @default(cuid())
+  vendorProfile   VendorProfile          @relation(fields: [vendorProfileId], references: [id], onDelete: Cascade)
+  vendorProfileId String
+  status          VendorAssessmentStatus @default(IN_PROGRESS)
+  answers         Json                   @default("{}")
+  score           Int?
+  tier            String?
+  decision        VendorReviewStatus?
+  decisionNotes   String?                @db.Text
+  startedBy       String
+  completedBy     String?
+  completedAt     DateTime?
+  createdAt       DateTime               @default(now())
+  updatedAt       DateTime               @updatedAt
+
+  @@index([vendorProfileId, createdAt])
+}
+
+model IngestionRun {
+  id                String   @id @default(cuid())
+  source            String
+  status            String   @default("running")
+  inputType         String   @default("json")
+  fileName          String?
+  triggeredByUser   User?    @relation(fields: [triggeredByUserId], references: [id])
+  triggeredByUserId String?
+  processed         Int      @default(0)
+  matched           Int      @default(0)
+  newTools          Int      @default(0)
+  updatedTools      Int      @default(0)
+  errorMessage      String?  @db.Text
+  details           Json?
+  startedAt         DateTime @default(now())
+  completedAt       DateTime?
+  createdAt         DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([source, createdAt])
+}
+
+// ─── Provider Telemetry ─────────────────────────────────
+
+model ProviderSyncRun {
+  id               String             @id @default(cuid())
+  provider         String
+  syncType         String
+  status           ProviderSyncStatus @default(RUNNING)
+  triggeredByUser  User?              @relation(fields: [triggeredByUserId], references: [id])
+  triggeredByUserId String?
+  startedAt        DateTime           @default(now())
+  completedAt      DateTime?
+  recordsProcessed Int                @default(0)
+  errorMessage     String?            @db.Text
+  metadata         Json?
+
+  rawSnapshots     ProviderRawSnapshot[]
+  usageBuckets     UsageBucket[]
+  costBuckets      CostBucket[]
+  providerProjects ProviderProject[]
+  providerActors   ProviderActor[]
+  assistantDailyStats AssistantDailyStat[]
+}
+
+model ProviderSyncWatermark {
+  // One row per SyncProvider (anthropic, openai, cursor, ...) driving the
+  // incremental window each scheduled provider sync pulls, plus one row per
+  // cursor-based stream (e.g. `chatgpt_enterprise`, `chatgpt_enterprise:AUTH_LOG`)
+  // recording the instant that stream has been ingested through.
+  provider   String   @id
+  // Last bucket day fully ingested (UTC midnight). The next scheduled sync
+  // starts `overlapDays` before this so providers that revise recent days
+  // are re-pulled.
+  watermark  DateTime
+  // Earliest day ever ingested — lets the UI say "history from X".
+  earliest   DateTime
+  // Opaque upstream pagination cursor for feed-style providers whose backfill
+  // was cut short by the page cap (Anthropic Compliance `last_id`). Null once
+  // the backfill has drained; unused by day-window providers.
+  cursor     String?
+  updatedAt  DateTime @updatedAt
+}
+
+// Session metadata from the Anthropic Compliance API (local: Claude Code,
+// Cowork, Science, Office add-ins; remote: cloud Cowork). Metadata only —
+// transcripts are never pulled. Gives per-person adoption of the Claude apps
+// for machines the OTel/MDM rollout missed.
+model ComplianceSession {
+  id             String    @id
+  provider       String
+  // local | remote (which Compliance endpoint listed it)
+  sessionKind    String
+  productSurface String?
+  userEmail      String?
+  userExternalId String?
+  workspaceId    String?
+  startedAt      DateTime?
+  lastActivityAt DateTime?
+  status         String?
+  raw            Json
+  ingestedAt     DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@index([userEmail, lastActivityAt])
+  @@index([productSurface, lastActivityAt])
+  @@index([provider, lastActivityAt])
+}
+
+model ProviderRawSnapshot {
+  id            String          @id @default(cuid())
+  provider      String
+  resourceType  String
+  externalId    String?
+  payload       Json
+  capturedAt    DateTime        @default(now())
+  syncRun       ProviderSyncRun @relation(fields: [syncRunId], references: [id], onDelete: Cascade)
+  syncRunId     String
+
+  @@index([provider, resourceType, capturedAt])
+  @@index([syncRunId])
+}
+
+model UsageBucket {
+  id               String          @id @default(cuid())
+  provider         String
+  bucketStart      DateTime
+  bucketEnd        DateTime
+  granularity      String
+  dimensionKey     String
+  model            String?
+  projectExternalId String?
+  projectName      String?
+  actorExternalId  String?
+  actorName        String?
+  apiKeyExternalId String?
+  apiKeyName       String?
+  // Provider-side workspace (Anthropic workspaces; other providers leave null).
+  workspaceExternalId String?
+  workspaceName       String?
+  inputTokens      Int             @default(0)
+  outputTokens     Int             @default(0)
+  totalTokens      Int             @default(0)
+  cacheReadTokens     Int          @default(0)
+  cacheCreationTokens Int          @default(0)
+  requestCount     Int?
+  metadata         Json?
+  syncRun          ProviderSyncRun @relation(fields: [syncRunId], references: [id], onDelete: Cascade)
+  syncRunId        String
+  aiSystem         AISystem?       @relation(fields: [aiSystemId], references: [id], onDelete: SetNull)
+  aiSystemId       String?
+  createdAt        DateTime        @default(now())
+
+  @@unique([provider, bucketStart, bucketEnd, granularity, dimensionKey])
+  @@index([provider, bucketStart, granularity])
+  @@index([syncRunId])
+  @@index([aiSystemId])
+  // Serves the KeyUsageRule evaluator: the per-key telemetry window scan and
+  // the min(bucketStart) first-seen backfill both filter on provider + key.
+  @@index([provider, apiKeyExternalId, bucketStart])
+}
+
+// Per-person, per-day coding-assistant productivity stats, promoted out of
+// UsageBucket.metadata JSON so dashboards and reports can filter and sum them
+// as columns. One row per (provider, day, actor).
+//   provider="claude_code" — Anthropic Admin API Claude Code analytics report
+//     (syncClaudeCodeAnalytics): sessions, lines, commits, PRs, tool
+//     accept/reject, per-model tokens and estimated cost.
+//   provider="cursor"      — Cursor Admin API daily-usage + usage-events
+//     (syncCursorTelemetry): requests, lines added/deleted/accepted, isActive,
+//     tokens and charged spend per developer.
+//   provider="claude_enterprise" — Claude Enterprise Analytics API
+//     (syncClaudeEnterpriseAnalytics): one row per person × day × product
+//     (chat, claude_code, cowork, design, office) with messages/sessions as
+//     `requests`, tokens and cost from the per-user usage/cost reports.
+// The same syncs still write the legacy UsageBucket rows (metadata JSON) for
+// one release; readers should use this table.
+model AssistantDailyStat {
+  id                  String          @id @default(cuid())
+  provider            String
+  // UTC midnight of the reported day.
+  day                 DateTime
+  // Email when the provider reports one; otherwise the API key name
+  // (Claude Code api_actor) or `user:<id>` (Cursor member without email).
+  actorExternalId     String
+  // Product surface within the provider, for providers that report several
+  // per person per day (Claude Enterprise: chat, claude_code, cowork, design,
+  // office). Empty string for single-surface providers (Claude Code, Cursor)
+  // so the unique key stays total.
+  product             String          @default("")
+  actorName           String?
+  // Cursor reports whether the member used the editor that day. Null when
+  // the provider does not report activity (Claude Code).
+  isActive            Boolean?
+  sessions            Int?
+  // Cursor: composer + chat + agent + cmd-k requests for the day.
+  requests            Int?
+  linesAdded          Int?
+  linesRemoved        Int?
+  // Cursor acceptedLinesAdded. Claude Code does not report acceptance.
+  linesAccepted       Int?
+  commits             Int?
+  pullRequests        Int?
+  toolAccepted        Int?
+  toolRejected        Int?
+  // USD. Claude Code: provider-estimated cost summed over model_breakdown.
+  // Cursor: charged spend from the usage-events feed; null when that feed
+  // returned nothing for the sync window (unknown, not zero).
+  estimatedCost       Float?
+  inputTokens         Int?
+  outputTokens        Int?
+  cacheReadTokens     Int?
+  cacheCreationTokens Int?
+  // Provider-specific detail not worth a column (Claude Code model_breakdown
+  // and tool_actions; Cursor request mix and most-used model).
+  metadata            Json?
+  syncRun             ProviderSyncRun @relation(fields: [syncRunId], references: [id], onDelete: Cascade)
+  syncRunId           String
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  @@unique([provider, day, actorExternalId, product])
+  @@index([provider, day])
+  @@index([actorExternalId, day])
+  @@index([syncRunId])
+}
+
+// Immutable compliance / audit events pulled from provider compliance feeds
+// (OpenAI Compliance Logs Platform AUTH_LOG + AUDIT_LOG today; the Anthropic
+// Compliance API Activity Feed is planned to share this table). `id` is the
+// upstream event id, so re-ingesting an overlapping window is a no-op.
+// Metadata only — conversation content and Codex prompt text are never
+// written here; those streams are aggregated into AssistantDailyStat.
+model ComplianceActivity {
+  id             String   @id
+  // "openai" for the ChatGPT Enterprise compliance logs, "anthropic" for the
+  // Anthropic Compliance API activity feed. Rows are keyed by the upstream id
+  // so re-pulls are idempotent.
+  provider       String
+  // Provider event category + action, e.g. `auth_log:login_success`,
+  // `audit_log:USER_ROLE_UPDATED` (OpenAI) or the verbatim upstream type
+  // `api_key_created`, `user_logged_in`, `compliance_api_accessed` (Anthropic).
+  type           String
+  occurredAt     DateTime
+  // Upstream workspace / organization id the event belongs to.
+  organizationId String?
+  // Anthropic: user_actor | api_actor | admin_api_key_actor |
+  // unauthenticated_user_actor | scim_directory_sync_actor | unknown.
+  actorType      String?
+  actorEmail     String?
+  actorUserId    String?
+  actorApiKeyId  String?
+  ipAddress      String?
+  // ISO 3166-1 alpha-2 when the upstream record carries a country; null when
+  // it is not derivable (UrNammu does not ship a GeoIP database).
+  ipCountry      String?
+  userAgent      String?
+  // Sanitized upstream event (envelope + action data), no message content.
+  payload        Json
+  ingestedAt     DateTime @default(now())
+
+  @@index([occurredAt])
+  @@index([actorEmail, occurredAt])
+  @@index([type, occurredAt])
+  @@index([provider, occurredAt])
+}
+
+model CostBucket {
+  id               String          @id @default(cuid())
+  provider         String
+  bucketStart      DateTime
+  bucketEnd        DateTime
+  granularity      String
+  dimensionKey     String
+  amount           Float           @default(0)
+  currency         String          @default("usd")
+  model            String?
+  projectExternalId String?
+  projectName      String?
+  actorExternalId  String?
+  actorName        String?
+  // Cost attribution (mirrors UsageBucket): the API key that incurred the
+  // spend where the provider reports it (gateways, LiteLLM, proxy), the
+  // provider-side workspace (Anthropic), and the governed system resolved
+  // through the Settings > Provider Admin APIs attribution mapping.
+  apiKeyExternalId String?
+  apiKeyName       String?
+  workspaceExternalId String?
+  workspaceName       String?
+  lineItem         String?
+  metadata         Json?
+  syncRun          ProviderSyncRun @relation(fields: [syncRunId], references: [id], onDelete: Cascade)
+  syncRunId        String
+  aiSystem         AISystem?       @relation(fields: [aiSystemId], references: [id], onDelete: SetNull)
+  aiSystemId       String?
+  createdAt        DateTime        @default(now())
+
+  @@unique([provider, bucketStart, bucketEnd, granularity, dimensionKey])
+  @@index([provider, bucketStart, granularity])
+  @@index([syncRunId])
+  @@index([aiSystemId, bucketStart])
+}
+
+model ProviderProject {
+  id               String          @id @default(cuid())
+  provider         String
+  externalId       String
+  name             String?
+  status           String?
+  metadata         Json?
+  lastSeenAt       DateTime        @default(now())
+  syncRun          ProviderSyncRun @relation(fields: [syncRunId], references: [id], onDelete: Cascade)
+  syncRunId        String
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@unique([provider, externalId])
+  @@index([syncRunId])
+}
+
+model ProviderActor {
+  id               String          @id @default(cuid())
+  provider         String
+  externalId       String
+  email            String?
+  name             String?
+  role             String?
+  metadata         Json?
+  lastSeenAt       DateTime        @default(now())
+  syncRun          ProviderSyncRun @relation(fields: [syncRunId], references: [id], onDelete: Cascade)
+  syncRunId        String
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  @@unique([provider, externalId])
+  @@index([syncRunId])
+}
+
+// ─── Directory Sync ─────────────────────────────────────
+// One row per person in an identity provider's directory (source =
+// "google_workspace" | "microsoft_365"). Written by the per-source directory
+// sync (src/lib/directory-sync.ts); read by Usage by Person (alias folding,
+// name/department enrichment, deactivated flag), the shadow-AI department
+// rollup, and the usage-after-deactivation governance check. Emails are
+// stored lower-cased; `aliases` excludes `primaryEmail` and is deduped.
+model DirectoryPerson {
+  id            String    @id @default(cuid())
+  source        String
+  externalId    String
+  primaryEmail  String
+  aliases       String[]  @default([])
+  displayName   String?
+  department    String?
+  title         String?
+  managerEmail  String?
+  orgUnit       String?
+  active        Boolean   @default(true)
+  deactivatedAt DateTime?
+  lastSyncedAt  DateTime
+  raw           Json?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@unique([source, externalId])
+  @@index([primaryEmail])
+  @@index([department])
+  @@index([active])
+}
+
+// ─── Risk Assessment ────────────────────────────────────
+
+model RiskAssessment {
+  id                String   @id @default(cuid())
+  aiSystem          AISystem @relation(fields: [aiSystemId], references: [id], onDelete: Cascade)
+  aiSystemId        String
+  biasScore         Float    @default(0)
+  securityScore     Float    @default(0)
+  privacyScore      Float    @default(0)
+  fairnessScore     Float    @default(0)
+  performanceScore  Float    @default(0)
+  transparencyScore Float    @default(0)
+  overallScore      Float    @default(0)
+  // Residual risk (after controls/mitigations) — all optional
+  residualBiasScore         Float?
+  residualSecurityScore     Float?
+  residualPrivacyScore      Float?
+  residualFairnessScore     Float?
+  residualPerformanceScore  Float?
+  residualTransparencyScore Float?
+  residualOverallScore      Float?
+  justifications    Json?    // { biasScore: "reason", securityScore: "reason", ... }
+  contextualAnswers Json?    // [{ id, category, prompt, answer }]
+  assessedBy        String
+  notes             String?  @db.Text
+  issues            RiskAssessmentIssue[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model RiskAssessmentIssue {
+  id               String           @id @default(cuid())
+  riskAssessment   RiskAssessment   @relation(fields: [riskAssessmentId], references: [id], onDelete: Cascade)
+  riskAssessmentId String
+  category         String
+  title            String
+  detail           String           @db.Text
+  remediation      String?          @db.Text
+  severity         RiskLevel        @default(MEDIUM)
+  status           RiskIssueStatus  @default(OPEN)
+  source           String           @default("assessment")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([riskAssessmentId, status, createdAt])
+}
+
+model AgentRiskReview {
+  id                   String     @id @default(cuid())
+  agent                AIAgent    @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  agentId              String
+  recommendedRiskLevel RiskLevel
+  reviewNeeded         Boolean    @default(false)
+  summary              String     @db.Text
+  concerns             Json       @default("[]")
+  recommendations      Json       @default("[]")
+  scores               Json
+  generatedBy          String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([agentId, createdAt])
+}
+
+// ─── API Usage Monitoring ───────────────────────────────
+
+model APIUsageLog {
+  id               String  @id @default(cuid())
+  user             User?   @relation(fields: [userId], references: [id])
+  userId           String?
+  provider         String
+  model            String?
+  department       String?
+  aiSystemId       String?
+  promptTokens     Int     @default(0)
+  completionTokens Int     @default(0)
+  totalTokens      Int     @default(0)
+  cost             Float   @default(0)
+  promptMetadata   Json?
+  flagged          Boolean @default(false)
+  // Why was the row flagged? Free-form string; known values:
+  //   "upstream_error" — provider returned non-2xx
+  //   "proxy_error"    — network error before reaching provider
+  //   "prompt_risk"    — prompt-risk rule matched (content block)
+  // Split out from `flagReason` so the UI can tell operational failures
+  // apart from actual block events.
+  flagCategory     String?
+  flagReason       String?
+
+  // Upstream provider request id: Anthropic returns it as `request-id`,
+  // OpenAI as `x-request-id`. Claude Code records the same id on its OTel
+  // `api_request` event, so this is the join that lets a session trace show
+  // the proxy's view of a model call — its measured latency, the upstream
+  // status, and any policy decision. Null for calls that never reached the
+  // provider, and for providers that return no id.
+  requestId        String?
+
+  createdAt DateTime @default(now())
+
+  @@index([aiSystemId, createdAt])
+  @@index([flagCategory, createdAt])
+  @@index([requestId])
+}
+
+// ─── Policy Denials (runtime enforcement log) ──────────
+// Separate from APIUsageLog because denials never hit the upstream provider
+// and have their own lifecycle (violation reasons, review state).
+model PolicyDenial {
+  id              String   @id @default(cuid())
+  provider        String
+  model           String?
+  aiSystemId      String?
+  userEmail       String?
+  department      String?
+  // "dryrun" = would have been blocked but request was allowed through;
+  // "enforced" = the proxy returned 403 to the client.
+  mode            String
+  policyIds       String[]
+  reasons         Json     // array of { ruleKey, message, recommendation? }
+  // Captured excerpt of the prompt for triage; truncated. Never the full body.
+  promptExcerpt   String?  @db.Text
+  requestMetadata Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([aiSystemId, createdAt])
+  @@index([mode, createdAt])
+}
+
+// ─── MCP Tool Governance ────────────────────────────────
+//
+// Written by both proxies (Vercel fallback and Azure Functions). One
+// AgentToolCall row per distinct tool the model invoked in a response, and
+// one AgentToolProfile row per (scope, server, tool) with first/last seen so
+// new tools can be surfaced. `scopeKey` is "agent:<id>", "system:<id>" or
+// "global" depending on what the request was attributed to via x-agent-id /
+// x-ai-system-id. Mirrored in ai-proxy/prisma/schema.prisma.
+
+model AgentToolCall {
+  id         String   @id @default(cuid())
+  agent      AIAgent? @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  agentId    String?
+  aiSystemId String?
+  provider   String
+  model      String?
+  /// "mcp_tool_use" | "server_tool_use" | "tool_use"
+  kind       String
+  serverName String?
+  toolName   String
+  /// Allowlist verdict at call time; true when no allowlist is configured.
+  approved   Boolean  @default(true)
+  /// A human-review trigger matched this call (see AIAgent.humanReviewTriggers).
+  reviewRequired Boolean @default(false)
+  requestId  String?
+  userEmail  String?
+  department String?
+
+  createdAt DateTime @default(now())
+
+  @@index([agentId, createdAt])
+  @@index([aiSystemId, createdAt])
+  @@index([approved, createdAt])
+  @@index([createdAt])
+}
+
+model AgentToolProfile {
+  id          String   @id @default(cuid())
+  scopeKey    String
+  agent       AIAgent? @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  agentId     String?
+  aiSystemId  String?
+  /// Server name, or "-" for provider/client tools.
+  serverKey   String
+  serverName  String?
+  serverHost  String?
+  /// "*" for the server itself (declared in a request), else the tool name.
+  toolName    String
+  /// "mcp_server" | "mcp_tool_use" | "server_tool_use" | "tool_use"
+  kind        String
+  approved    Boolean  @default(true)
+  callCount   Int      @default(0)
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([scopeKey, serverKey, toolName])
+  @@index([agentId, lastSeenAt])
+  @@index([aiSystemId, lastSeenAt])
+  @@index([approved, lastSeenAt])
+}
+
+// ─── Compliance & Policy ────────────────────────────────
+
+model Policy {
+  id          String              @id @default(cuid())
+  name        String
+  description String?             @db.Text
+  framework   ComplianceFramework
+  version     String              @default("1.0")
+  content     String              @db.Text
+  rules       Json?
+  status      PolicyStatus        @default(DRAFT)
+
+  assignments PolicyAssignment[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model PolicyAssignment {
+  id               String           @id @default(cuid())
+  policy           Policy           @relation(fields: [policyId], references: [id], onDelete: Cascade)
+  policyId         String
+  aiSystem         AISystem         @relation(fields: [aiSystemId], references: [id], onDelete: Cascade)
+  aiSystemId       String
+  complianceStatus ComplianceStatus @default(NOT_ASSESSED)
+  evidence         String?          @db.Text
+  assessedAt       DateTime?
+  nextReviewDate   DateTime?
+  issues           ComplianceIssue[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([policyId, aiSystemId])
+}
+
+model ComplianceIssue {
+  id                 String           @id @default(cuid())
+  policyAssignment   PolicyAssignment @relation(fields: [policyAssignmentId], references: [id], onDelete: Cascade)
+  policyAssignmentId String
+  requirement        String
+  title              String
+  detail             String           @db.Text
+  remediation        String?          @db.Text
+  severity           RiskLevel        @default(MEDIUM)
+  status             RiskIssueStatus  @default(OPEN)
+  source             String           @default("ai_assessment")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([policyAssignmentId, status, createdAt])
+}
+
+// A per-system assessment of one framework requirement. Rows created through
+// the Framework Controls card point at a catalog control via `controlId`;
+// legacy/free-text rows (controlId null) still count toward the executive
+// compliance rate but not toward framework coverage.
+model ComplianceMapping {
+  id          String              @id @default(cuid())
+  aiSystem    AISystem            @relation(fields: [aiSystemId], references: [id], onDelete: Cascade)
+  aiSystemId  String
+  framework   ComplianceFramework
+  requirement String
+  control     FrameworkControl?   @relation(fields: [controlId], references: [id], onDelete: SetNull)
+  controlId   String?
+  status      ComplianceStatus    @default(NOT_ASSESSED)
+  evidence    String?             @db.Text
+  assessedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([aiSystemId, controlId])
+  @@index([aiSystemId, framework])
+  @@index([controlId])
+}
+
+// ─── Framework Control Catalog ──────────────────────────
+//
+// The seeded library of controls/requirements per framework (NIST AI RMF
+// categories, ISO/IEC 42001 Annex A controls, EU AI Act articles, SOC 2 trust
+// services criteria). Rows are inserted by migration and mirrored in
+// src/lib/framework-catalog.ts — keep the two in sync. `code` is the stable
+// identity within a framework ("GOVERN 1", "A.6.2.4", "Art. 9", "CC7").
+model FrameworkControl {
+  id          String              @id @default(cuid())
+  framework   ComplianceFramework
+  code        String
+  title       String
+  description String              @db.Text
+  category    String
+  sortOrder   Int
+  builtIn     Boolean             @default(true)
+
+  crosswalkFrom ControlCrosswalk[] @relation("CrosswalkFrom")
+  crosswalkTo   ControlCrosswalk[] @relation("CrosswalkTo")
+  mappings      ComplianceMapping[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([framework, code])
+  @@index([framework, sortOrder])
+}
+
+// An undirected equivalence between two controls in different frameworks.
+// Stored once per pair; coverage computation treats it symmetrically, so a
+// COMPLIANT mapping on either side satisfies the other as "inherited".
+model ControlCrosswalk {
+  id            String           @id @default(cuid())
+  fromControl   FrameworkControl @relation("CrosswalkFrom", fields: [fromControlId], references: [id], onDelete: Cascade)
+  fromControlId String
+  toControl     FrameworkControl @relation("CrosswalkTo", fields: [toControlId], references: [id], onDelete: Cascade)
+  toControlId   String
+  note          String?
+
+  createdAt DateTime @default(now())
+
+  @@unique([fromControlId, toControlId])
+  @@index([toControlId])
+}
+
+// ─── EU AI Act Classification ───────────────────────────
+//
+// Output of the per-system classification wizard: the system's risk tier
+// under Regulation (EU) 2024/1689, the organisation's role, the flags that
+// drive specific obligations, and the list of applicable article codes
+// (matching FrameworkControl.code for EU_AI_ACT). `answers` keeps the raw
+// wizard input so the classification can be re-derived and audited; the
+// derived columns are what the UI, blockers and executive posture read.
+model EuAiActClassification {
+  id                   String          @id @default(cuid())
+  aiSystem             AISystem        @relation(fields: [aiSystemId], references: [id], onDelete: Cascade)
+  aiSystemId           String          @unique
+  role                 EuAiActRole
+  tier                 EuAiActRiskTier
+  annexIProduct        Boolean         @default(false)
+  annexIiiCategories   String[]        @default([])
+  derogationClaimed    Boolean         @default(false)
+  transparencyRequired Boolean         @default(false)
+  friaRequired         Boolean         @default(false)
+  gpaiDeployer         Boolean         @default(false)
+  gpaiProvider         Boolean         @default(false)
+  applicableArticles   String[]        @default([])
+  answers              Json
+  rationale            String?         @db.Text
+  notes                String?         @db.Text
+  obligationDeadline   DateTime?
+  classifiedByUser     User            @relation("EuAiActClassifiedBy", fields: [classifiedByUserId], references: [id], onDelete: Cascade)
+  classifiedByUserId   String
+  classifiedAt         DateTime        @default(now())
+  reviewDueAt          DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tier])
+  @@index([classifiedByUserId, createdAt])
+}
+
+model SystemApproval {
+  id               String           @id @default(cuid())
+  aiSystem         AISystem         @relation(fields: [aiSystemId], references: [id], onDelete: Cascade)
+  aiSystemId       String
+  decidedByUser    User             @relation(fields: [decidedByUserId], references: [id], onDelete: Cascade)
+  decidedByUserId  String
+  decision         ApprovalDecision
+  rationale        String?          @db.Text
+  createdAt        DateTime         @default(now())
+
+  @@index([aiSystemId, createdAt])
+  @@index([decidedByUserId, createdAt])
+}
+
+model GovernanceReview {
+  id              String               @id @default(cuid())
+  aiSystem        AISystem             @relation(fields: [aiSystemId], references: [id], onDelete: Cascade)
+  aiSystemId      String
+  stage           GovernanceReviewStage
+  decidedByUser   User                 @relation(fields: [decidedByUserId], references: [id], onDelete: Cascade)
+  decidedByUserId String
+  approved        Boolean              @default(false)
+  rationale       String?              @db.Text
+  createdAt       DateTime             @default(now())
+
+  @@index([aiSystemId, stage, createdAt])
+  @@index([decidedByUserId, createdAt])
+}
+
+model GovernanceException {
+  id               String                    @id @default(cuid())
+  aiSystem         AISystem                  @relation(fields: [aiSystemId], references: [id], onDelete: Cascade)
+  aiSystemId       String
+  approvedByUser   User                      @relation(fields: [approvedByUserId], references: [id], onDelete: Cascade)
+  approvedByUserId String
+  title            String
+  rationale        String                    @db.Text
+  expiresAt        DateTime
+  status           GovernanceExceptionStatus @default(ACTIVE)
+  createdAt        DateTime                  @default(now())
+  updatedAt        DateTime                  @updatedAt
+
+  @@index([aiSystemId, status, expiresAt])
+  @@index([approvedByUserId, createdAt])
+}
+
+model EvidenceArtifact {
+  id              String   @id @default(cuid())
+  aiSystem        AISystem @relation(fields: [aiSystemId], references: [id], onDelete: Cascade)
+  aiSystemId      String
+  uploadedByUser  User     @relation(fields: [uploadedByUserId], references: [id], onDelete: Cascade)
+  uploadedByUserId String
+  title           String
+  category        String
+  content         String?  @db.Text
+  linkUrl         String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([aiSystemId, createdAt])
+  @@index([uploadedByUserId, createdAt])
+}
+
+// An incident belongs to a system, an agent, or both (CHECK constraint in
+// migration 20260930210000_agent_incidents_retirement enforces at least one).
+model GovernanceIncident {
+  id              String        @id @default(cuid())
+  aiSystem        AISystem?     @relation(fields: [aiSystemId], references: [id], onDelete: Cascade)
+  aiSystemId      String?
+  agent           AIAgent?      @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  agentId         String?
+  openedByUser    User          @relation(fields: [openedByUserId], references: [id], onDelete: Cascade)
+  openedByUserId  String
+  title           String
+  summary         String?       @db.Text
+  severity        AlertSeverity
+  status          AlertStatus   @default(OPEN)
+  openedAt        DateTime      @default(now())
+  closedAt        DateTime?
+  alerts          Alert[]
+  investigation   Investigation?
+  createdAt       DateTime      @default(now())
+  updatedAt       DateTime      @updatedAt
+
+  @@index([aiSystemId, status, openedAt])
+  @@index([agentId, status, openedAt])
+  @@index([openedByUserId, createdAt])
+}
+
+// ─── Alerts ─────────────────────────────────────────────
+
+model Alert {
+  id             String            @id @default(cuid())
+  title          String
+  description    String?           @db.Text
+  severity       AlertSeverity
+  status         AlertStatus       @default(OPEN)
+  source         String
+  aiSystem       AISystem?         @relation(fields: [aiSystemId], references: [id])
+  aiSystemId     String?
+  governanceIncident GovernanceIncident? @relation(fields: [governanceIncidentId], references: [id])
+  governanceIncidentId String?
+  relatedToolId  String?
+  discoveredTool DiscoveredAITool? @relation(fields: [relatedToolId], references: [id])
+  investigation  Investigation?
+
+  // Structured prompt risk metadata (for source = "dangerous_prompt")
+  promptRiskMetadata    Json?
+  // Structured key-usage rule metadata (for source = "key_usage_rule"):
+  // { ruleKey, conditionType, provider, apiKeyExternalId, apiKeyName,
+  //   metric?, observed?, baseline?, threshold?, windowStart, windowEnd }
+  keyUsageMetadata      Json?
+  falsePositive         Boolean   @default(false)
+  falsePositiveReason   String?   @db.Text
+  falsePositiveByUser   User?     @relation("AlertFalsePositiveBy", fields: [falsePositiveByUserId], references: [id], onDelete: SetNull)
+  falsePositiveByUserId String?
+  falsePositiveAt       DateTime?
+
+  promptRiskExceptions  PromptRiskException[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([aiSystemId])
+  @@index([status, createdAt])
+  @@index([source, falsePositive])
+}
+
+model Investigation {
+  id                  String              @id @default(cuid())
+  title               String
+  summary             String?             @db.Text
+  status              InvestigationStatus @default(OPEN)
+  ownerUser           User?               @relation("InvestigationOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
+  ownerUserId         String?
+  aiSystem            AISystem?           @relation(fields: [aiSystemId], references: [id], onDelete: SetNull)
+  aiSystemId          String?
+  alert               Alert?              @relation(fields: [alertId], references: [id], onDelete: SetNull)
+  alertId             String?             @unique
+  governanceIncident  GovernanceIncident? @relation(fields: [governanceIncidentId], references: [id], onDelete: SetNull)
+  governanceIncidentId String?            @unique
+  notes               String?             @db.Text
+  resolutionSummary   String?             @db.Text
+  createdAt           DateTime            @default(now())
+  updatedAt           DateTime            @updatedAt
+  resolvedAt          DateTime?
+
+  @@index([status, createdAt])
+  @@index([ownerUserId, status])
+  @@index([aiSystemId, status])
+}
+
+// ─── Prompt Risk Exceptions ────────────────────────────
+
+model PromptRiskException {
+  id              String    @id @default(cuid())
+  category        String    // stable rule key: prompt_injection, secret_extraction, etc.
+  pattern         String?   @db.Text // optional: specific signal substring; null = entire category
+  reason          String    @db.Text
+  sourceAlert     Alert?    @relation(fields: [sourceAlertId], references: [id], onDelete: SetNull)
+  sourceAlertId   String?
+  createdByUser   User      @relation("PromptRiskExceptionCreator", fields: [createdByUserId], references: [id])
+  createdByUserId String
+  active          Boolean   @default(true)
+  expiresAt       DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@index([category, active])
+  @@index([createdByUserId])
+}
+
+// ─── Prompt Risk Detection Rules ───────────────────────
+
+model PromptRiskRule {
+  id          String   @id @default(cuid())
+  key         String   @unique // stable identifier, referenced by exceptions (prompt_injection, etc.)
+  label       String
+  severity    String   // "critical" | "warning"
+  patterns    String[] // array of regex source strings (flags forced to "i")
+  description String?  @db.Text
+  enabled     Boolean  @default(true)
+  builtIn     Boolean  @default(false) // seeded defaults: cannot be deleted, can be disabled/edited, can be reset
+
+  // Snapshots of the default definition for built-in rules. Used by the "reset to default"
+  // action so the original label/patterns/severity are recoverable.
+  defaultLabel    String?
+  defaultSeverity String?
+  defaultPatterns String[] @default([])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([enabled])
+}
+
+// ─── Claude Code Telemetry (OTel) ──────────────────────
+// One row per OTLP data point pushed by the Claude Code clients through the
+// Azure Container Apps OTel Collector. Complementary to the daily Admin-API
+// pull that populates UsageBucket(provider="claude_code") — this table holds
+// the live, fine-grained signal (per-session, per-minute) used for the
+// "Live telemetry" panel on the Claude Code Oversight page. Metrics-only;
+// prompt content is never written here (the Collector filter pipeline drops
+// non-metric signals at the gateway).
+model ClaudeCodeMetric {
+  id             String   @id @default(cuid())
+  // Content hash of the OTel record; lets `createMany({skipDuplicates})`
+  // drop re-sent batches when the collector retries a timed-out export.
+  dedupeKey      String?  @unique
+  // OTel data-point timestamp (wall-clock from the client)
+  timestamp      DateTime
+  // When UrNammu accepted the payload (server clock — for latency/debug)
+  receivedAt     DateTime @default(now())
+
+  // Identity (resource attributes)
+  userId         String?
+  userEmail      String?
+  sessionId      String?
+  organizationId String?
+  accountUuid    String?
+
+  // Environment
+  appVersion     String?
+  hostType       String?
+  osType         String?
+  osVersion      String?
+  terminalType   String?
+
+  // Metric
+  metricName     String
+  value          Float
+  unit           String?
+
+  // Lifted common attributes (null when not applicable for the metric)
+  model          String?
+  tokenType      String?
+  tool           String?
+  decision       String?
+  linesType      String?
+
+  // Full attribute bag (resource + data-point attrs, merged)
+  attributes     Json?
+
+  @@index([timestamp])
+  @@index([metricName, timestamp])
+  @@index([userEmail, timestamp])
+  @@index([sessionId, timestamp])
+}
+
+// Live OTel *events* (logs/events protocol) from Claude Code clients — the
+// audit-trail companion to ClaudeCodeMetric. Content fields (prompt,
+// tool_input, …) are stripped at the collector gateway and again on ingest,
+// so this table never stores source code or prompt text.
+model ClaudeCodeEvent {
+  id             String   @id @default(cuid())
+  // Content hash of the OTel record; lets `createMany({skipDuplicates})`
+  // drop re-sent batches when the collector retries a timed-out export.
+  dedupeKey      String?  @unique
+  // OTel log-record timestamp (wall-clock from the client)
+  timestamp      DateTime
+  // When UrNammu accepted the payload (server clock)
+  receivedAt     DateTime @default(now())
+
+  // Correlation
+  sessionId      String?
+  promptId       String?
+  eventSequence  Int?
+
+  // Identity (standard attributes)
+  userId         String?
+  userEmail      String?
+  organizationId String?
+  accountUuid    String?
+  appVersion     String?
+  terminalType   String?
+  // app.entrypoint — how the session launched (cli, claude-vscode, sdk-*,
+  // or the Cowork VM's "local-agent"). Lets us distinguish Cowork from CLI.
+  entrypoint     String?
+
+  // Event classification (e.g. "user_prompt", "tool_result",
+  // "tool_decision", "api_request", "api_error", "mcp_server_connection")
+  eventName      String
+
+  // Lifted common attributes (null when not applicable for the event)
+  toolName       String?
+  decision       String?
+  decisionSource String?
+  success        Boolean?
+  durationMs     Int?
+  model          String?
+  statusCode     Int?
+  errorType      String?
+
+  // Dangerous-prompt verdict (Option A). The raw prompt is NEVER stored —
+  // it's analyzed in-memory at ingest and only the verdict persists here
+  // (severity + matched rule categories). Sanitized excerpts live on the
+  // linked Alert, not here.
+  riskSeverity   String?
+  riskCategory   String?
+
+  // Full attribute bag (content keys removed)
+  attributes     Json?
+
+  @@index([timestamp])
+  @@index([eventName, timestamp])
+  @@index([userEmail, timestamp])
+  @@index([sessionId, timestamp])
+  @@index([promptId])
+  @@index([riskSeverity, timestamp])
+  @@index([entrypoint, timestamp])
+}
+
+// ─── Cursor telemetry (OTel) ───────────────────────────
+// Cursor reports via LangGuard-AI/cursor-otel-hook, which emits OTLP *spans*
+// only (no metrics, no token/cost). The collector fans the span stream two
+// ways: raw spans → CursorSpan (audit), and a spanmetrics connector derives
+// cursor.* activity metrics → CursorMetric. Mirrors the Claude Code pipeline
+// (ClaudeCodeMetric / ClaudeCodeEvent) but is activity-only — there is no
+// token or cost data available from Cursor's hook.
+model CursorMetric {
+  id          String   @id @default(cuid())
+  // Content hash of the OTel record; lets `createMany({skipDuplicates})`
+  // drop re-sent batches when the collector retries a timed-out export.
+  dedupeKey      String?  @unique
+  // OTel data-point timestamp (wall-clock from the collector's connector)
+  timestamp   DateTime
+  // When UrNammu accepted the payload (server clock)
+  receivedAt  DateTime @default(now())
+
+  // Identity (only present if tagged via OTEL_RESOURCE_ATTRIBUTES on client)
+  serviceName String?
+  sessionId   String?
+  userId      String?
+  userEmail   String?
+  appVersion  String?
+
+  // Metric (derived: cursor.calls Sum, cursor.duration Histogram count)
+  metricName  String
+  value       Float
+  unit        String?
+
+  // Lifted span dimensions (null when not applicable)
+  spanName      String?
+  spanKind      String?
+  genAiToolName String?
+  hookEvent     String?
+
+  // Full attribute bag (resource + data-point attrs, merged)
+  attributes  Json?
+
+  @@index([timestamp])
+  @@index([metricName, timestamp])
+  @@index([userEmail, timestamp])
+  @@index([sessionId, timestamp])
+}
+
+// Raw Cursor spans — the audit-trail companion to CursorMetric. Content
+// fields (prompt, tool arguments, completions) are stripped at the collector
+// gateway and again on ingest, so this table never stores source code or
+// prompt text.
+model CursorSpan {
+  id            String   @id @default(cuid())
+  // Content hash of the OTel record; lets `createMany({skipDuplicates})`
+  // drop re-sent batches when the collector retries a timed-out export.
+  dedupeKey      String?  @unique
+  // OTel span start timestamp (wall-clock from the client)
+  timestamp     DateTime
+  // When UrNammu accepted the payload (server clock)
+  receivedAt    DateTime @default(now())
+
+  // Trace correlation
+  traceId       String?
+  spanId        String?
+  parentSpanId  String?
+  sessionId     String?
+
+  // Identity (only if tagged via OTEL_RESOURCE_ATTRIBUTES on client)
+  serviceName   String?
+  userId        String?
+  userEmail     String?
+  appVersion    String?
+
+  // Span classification
+  spanName      String
+  // Semantic kind (langsmith.span.kind): llm | tool | chain
+  spanKind      String?
+  // langsmith.metadata.hook_event: sessionStart, preToolUse, postToolUse,
+  // beforeShellExecution, beforeMCPExecution, afterFileEdit, beforeSubmitPrompt…
+  hookEvent     String?
+
+  // GenAI semantic-convention attributes
+  genAiSystem    String?
+  genAiModel     String?
+  genAiOperation String?
+  genAiToolName  String?
+
+  durationMs    Int?
+  success       Boolean?
+
+  // Dangerous-prompt verdict (Option A). The raw prompt is NEVER stored —
+  // it's analyzed in-memory at ingest and only the verdict persists here.
+  riskSeverity  String?
+  riskCategory  String?
+
+  // Full attribute bag (content keys removed)
+  attributes    Json?
+
+  @@index([timestamp])
+  @@index([hookEvent, timestamp])
+  @@index([spanKind, timestamp])
+  @@index([userEmail, timestamp])
+  @@index([sessionId, timestamp])
+  @@index([traceId])
+  @@index([riskSeverity, timestamp])
+}
+
+// ─── Assistant extensions (plugins, MCP servers, skills, hooks, agents) ─
+// Per-person inventory of what each coding assistant has loaded, derived
+// from the OTel stream rather than from the endpoint agent: Claude Code's
+// plugin_loaded / plugin_installed / hook_registered / mcp_server_connection
+// / skill_activated / subagent_completed events, and Cursor's MCP-execution
+// spans. One row per (client, person, kind, key), merged on repeat, so the
+// table grows with the fleet's extension surface, not with time. Names and
+// provenance only — never arguments, prompts, paths or hook commands.
+//
+// Claude Code redacts third-party names ("third-party", "custom_skill",
+// "custom") and omits MCP server names unless OTEL_LOG_TOOL_DETAILS=1 is set
+// in managed settings; `redacted` marks rows whose name is such a placeholder.
+model AssistantExtension {
+  id        String @id @default(cuid())
+  // "claude_code" | "cursor"
+  client    String
+  // "" when the client was not tagged with an identity (part of the merge key,
+  // so it cannot be NULL — Postgres treats NULLs as distinct in unique indexes)
+  userEmail String @default("")
+  userId    String?
+  // "plugin" | "mcp_server" | "skill" | "hook" | "agent"
+  kind      String
+  // Merge identity within (client, userEmail, kind) — plugin id hash,
+  // server name, source:skill, hook source/event/type, source:agent.
+  key       String
+  name      String
+  // The name is a client-side placeholder, not the real identifier.
+  redacted  Boolean @default(false)
+  // Provenance: plugin.scope | server_scope | skill.source | hook_source |
+  // agent.source
+  source       String?
+  marketplace  String?
+  // Owning plugin, when a server / skill / hook / agent is plugin-provided.
+  pluginName   String?
+  pluginIdHash String?
+  version      String?
+  // MCP only: stdio | sse | http
+  transport  String?
+  // MCP only: last connection status (connected | failed | disconnected)
+  lastStatus String?
+  // Plugins only: default-enable | org-policy | admin-install | seed-mount |
+  // user-install
+  enabledVia String?
+  // Kind-specific extras (has_hooks / has_mcp, hook event + type, cursor tool
+  // names, install trigger). Never content.
+  detail Json?
+
+  // Observation weight: events seen, approximate distinct sessions, failed
+  // MCP connections. Summed across ingest batches.
+  observations Int @default(0)
+  sessions     Int @default(0)
+  failures     Int @default(0)
+  firstSeenAt  DateTime
+  lastSeenAt   DateTime
+  lastSessionId  String?
+  lastAppVersion String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([client, userEmail, kind, key])
+  @@index([kind, lastSeenAt])
+  @@index([userEmail, lastSeenAt])
+  @@index([client, kind, lastSeenAt])
+}
+
+// ─── Plugin content (what a marketplace plugin actually ships) ──────────
+// The inventory above knows a plugin's name, marketplace and version. These
+// rows hold what that plugin ships — its manifest, every SKILL.md, its hook
+// and MCP server definitions, commands and agents — fetched from the
+// marketplace's GitHub source at the commit the marketplace pins, so a
+// reviewer can read what the fleet is running without touching a laptop.
+// One row per (marketplace, plugin); files hang off it and are replaced on
+// every fetch. `contentHash` changes when any file changes, and
+// `reviewedHash` records which content a reviewer signed off, so a plugin
+// that updates after review shows as needing a second look.
+model PluginContent {
+  id          String @id @default(cuid())
+  marketplace String
+  plugin      String
+
+  // Resolved source: GitHub owner/name, subdirectory ("" for the repo
+  // root), the ref the marketplace asked for and the commit it resolved to.
+  repo      String?
+  path      String?
+  ref       String?
+  commitSha String?
+  version   String?
+
+  // fetched | unsupported (non-GitHub or command source) | not_found |
+  // error. `statusReason` explains anything but fetched.
+  status       String
+  statusReason String? @db.Text
+
+  // Parsed .claude-plugin/plugin.json.
+  manifest Json?
+
+  skillCount     Int @default(0)
+  hookCount      Int @default(0)
+  mcpServerCount Int @default(0)
+  commandCount   Int @default(0)
+  agentCount     Int @default(0)
+
+  // SHA-256 over the sorted (path, blob sha) pairs of the stored files.
+  contentHash         String?
+  previousContentHash String?
+  changedAt           DateTime?
+  fetchedAt           DateTime
+
+  reviewedAt   DateTime?
+  reviewedBy   String?
+  reviewedHash String?
+  reviewNote   String? @db.Text
+
+  files PluginContentFile[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([marketplace, plugin])
+  @@index([status, fetchedAt])
+}
+
+// One file a plugin ships. `text` is kept for text files up to the storage
+// cap (truncated flag set beyond it); binary or oversize files keep only
+// their path and blob sha.
+model PluginContentFile {
+  id        String        @id @default(cuid())
+  content   PluginContent @relation(fields: [contentId], references: [id], onDelete: Cascade)
+  contentId String
+
+  // manifest | readme | skill | hook | mcp | command | agent | other
+  kind String
+  // Path relative to the plugin root.
+  path String
+  // Skill / command / agent name derived from the path.
+  name String?
+  // Git blob sha — stable identity for "did this file change".
+  sha       String
+  size      Int
+  text      String? @db.Text
+  truncated Boolean @default(false)
+
+  @@unique([contentId, path])
+  @@index([contentId, kind])
+}
+
+// ─── Proxy Health Snapshots ────────────────────────────
+// One row per sync, holding the Azure Monitor metric values captured for the
+// Nammu AI proxy function app over a specific window. Drives the /proxy-health
+// live-ops page. Intentionally separate from `ProviderSyncRun` (which tracks
+// provider-upstream sync jobs, not proxy health).
+model ProxyHealthSnapshot {
+  id                String   @id @default(cuid())
+  capturedAt        DateTime @default(now())
+  windowStart       DateTime
+  windowEnd         DateTime
+  // Azure Monitor metrics (nullable — partial metric responses are common)
+  invocationCount   Int?
+  http2xxCount      Int?
+  http4xxCount      Int?
+  http5xxCount      Int?
+  avgResponseTimeMs Float?
+  // Raw metric payload for debugging / future fields
+  rawMetrics        Json?
+  // Error captured from the Monitor query, if any. Presence of a snapshot
+  // with syncError set = last sync attempt failed; counters may be stale.
+  syncError         String?  @db.Text
+
+  @@index([capturedAt])
+}
+
+model SpendBudget {
+  id                  String          @id @default(cuid())
+  scopeType           BudgetScopeType
+  scopeKey            String
+  label               String
+  monthlyBudget       Float
+  warningThresholdPct Int             @default(80)
+  ownerUser           User?           @relation("SpendBudgetOwner", fields: [ownerUserId], references: [id], onDelete: SetNull)
+  ownerUserId         String?
+  createdAt           DateTime        @default(now())
+  updatedAt           DateTime        @updatedAt
+
+  @@unique([scopeType, scopeKey])
+  @@index([scopeType, scopeKey])
+}
+
+// ─── Audit Log ──────────────────────────────────────────
+
+model AuditLog {
+  id         String    @id @default(cuid())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  userId     String
+  action     String
+  entityType String
+  entityId   String
+  aiSystem   AISystem? @relation("SystemAuditLogs", fields: [aiSystemId], references: [id], onDelete: SetNull)
+  aiSystemId String?
+  agent      AIAgent?  @relation("AgentAuditLogs", fields: [agentId], references: [id], onDelete: SetNull)
+  agentId    String?
+  changes    Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+  @@index([aiSystemId])
+  @@index([agentId])
+}
+
+// ─── Reporting Suite ────────────────────────────────────
+// User-defined and template-based reports over governance data. A
+// ReportDefinition captures *what* to report (data source + columns +
+// filters + grouping); a ReportSchedule captures *when* to run it and
+// *who* receives it; a ReportRun is a single materialized execution
+// (ad-hoc or scheduled) whose rendered artifact is stored for download
+// and optionally emailed.
+
+enum ReportDataSource {
+  AI_SYSTEMS
+  AI_AGENTS
+  RISK_ASSESSMENTS
+  COMPLIANCE
+  API_USAGE
+  ALERTS
+  SHADOW_AI
+  AUDIT_LOG
+  // Computed cross-surface rollup (Claude Code, Cowork, Cursor, proxy) keyed by
+  // person; served by a loader rather than a single model. See
+  // src/lib/people-usage.ts.
+  PEOPLE_USAGE
+}
+
+enum ReportFormat {
+  PDF
+  CSV
+  JSON
+}
+
+enum ReportVisibility {
+  PRIVATE
+  SHARED
+}
+
+enum ReportFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
+enum ReportRunStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+model ReportDefinition {
+  id          String           @id @default(cuid())
+  name        String
+  description String?          @db.Text
+  dataSource  ReportDataSource
+  templateKey String? // set when created from a prebuilt template
+  config      Json // { columns[], filters[], groupBy?, chartType?, dateRange?, sort?, rowLimit }
+  visibility  ReportVisibility @default(PRIVATE)
+  owner       User             @relation("ReportDefinitionOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+  ownerId     String
+  schedules   ReportSchedule[]
+  runs        ReportRun[]
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@index([ownerId, createdAt])
+  @@index([visibility, createdAt])
+}
+
+model ReportSchedule {
+  id           String           @id @default(cuid())
+  definition   ReportDefinition @relation(fields: [definitionId], references: [id], onDelete: Cascade)
+  definitionId String
+  frequency    ReportFrequency
+  hourUtc      Int              @default(8)
+  dayOfWeek    Int? // 0-6 (Sun-Sat) for WEEKLY
+  dayOfMonth   Int? // 1-28 for MONTHLY
+  format       ReportFormat     @default(PDF)
+  recipients   String[] // email addresses
+  enabled      Boolean          @default(true)
+  lastRunAt    DateTime?
+  nextRunAt    DateTime
+  createdById  String
+  runs         ReportRun[]
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@index([enabled, nextRunAt])
+  @@index([definitionId])
+}
+
+model ReportRun {
+  id            String           @id @default(cuid())
+  definition    ReportDefinition @relation(fields: [definitionId], references: [id], onDelete: Cascade)
+  definitionId  String
+  schedule      ReportSchedule?  @relation(fields: [scheduleId], references: [id], onDelete: SetNull)
+  scheduleId    String?
+  format        ReportFormat
+  status        ReportRunStatus  @default(PENDING)
+  rowCount      Int?
+  content       Bytes? // rendered artifact for history download; skipped if too large
+  contentType   String?
+  filename      String?
+  error         String?          @db.Text
+  deliveredTo   String[]         @default([])
+  triggeredById String? // null for cron-triggered runs
+  createdAt     DateTime         @default(now())
+
+  @@index([definitionId, createdAt])
+  @@index([scheduleId, createdAt])
+}
+
+// ─── Key Usage Rules (anomalous API key detection) ─────
+// Admin-authored rules evaluated hourly against per-key UsageBucket
+// telemetry. Matches raise Alerts (source = "key_usage_rule"); nothing is
+// blocked — this is a detection/flagging surface, not an enforcement one.
+//
+// Condition-specific parameters live in `config` rather than a wide table of
+// mutually-exclusive nullable columns. The shape is a discriminated union on
+// `conditionType`, validated by Zod in `src/lib/validations/key-usage-rule.ts`
+// and parsed by `parseKeyUsageRuleConfig()` in `src/lib/key-usage-rules.ts`.
+enum KeyUsageConditionType {
+  // Absolute volume over the window: tokens / cost / requests past a ceiling.
+  VOLUME_THRESHOLD
+  // Recent window vs. the immediately preceding baseline window.
+  SPIKE_MULTIPLIER
+  // A key observed for the first time, with non-trivial volume.
+  NEW_KEY
+  // A key idle for N days that started transacting again.
+  DORMANT_REACTIVATION
+  // Activity outside declared business hours/days. Requires hourly buckets.
+  OFF_HOURS
+  // Key used a model outside its allowlist.
+  MODEL_ALLOWLIST
+  // Key suddenly spanning more distinct projects/actors than expected.
+  FAN_OUT
+}
+
+model KeyUsageRule {
+  id                String                @id @default(cuid())
+  // Stable identifier, used for alert dedupe keys and audit references.
+  key               String                @unique
+  label             String
+  description       String?               @db.Text
+  conditionType     KeyUsageConditionType
+  severity          AlertSeverity
+  // Scope filters. Empty array = applies to every value of that dimension.
+  providers         String[]              @default([])
+  apiKeyExternalIds String[]              @default([])
+  // Condition-specific parameters (see enum comment above).
+  config            Json
+  enabled           Boolean               @default(true)
+  builtIn           Boolean               @default(false)
+
+  // Snapshots of the seeded definition, so "reset to default" can restore a
+  // built-in rule an admin has since edited. Mirrors PromptRiskRule.
+  defaultLabel    String?
+  defaultSeverity AlertSeverity?
+  defaultConfig   Json?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([enabled])
+  @@index([conditionType])
+}
+
+// Observed lifetime state per provider API key. Maintained by the hourly
+// evaluator; the NEW_KEY and DORMANT_REACTIVATION conditions read it.
+//
+// `firstSeenAt` is backfilled from the earliest UsageBucket for the key when
+// the profile row is created, NOT set to the creation timestamp — otherwise
+// every pre-existing key would look brand new the first time the job runs.
+model ApiKeyProfile {
+  id           String   @id @default(cuid())
+  provider     String
+  externalId   String
+  name         String?
+  firstSeenAt  DateTime
+  // Last bucket start with non-zero volume attributed to this key.
+  lastActiveAt DateTime
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@unique([provider, externalId])
+  @@index([provider, lastActiveAt])
+}
+
+// ─── General network proxy ──────────────────────────────
+//
+// URL block rules evaluated by both proxies' `/proxy/net/{host}/{*path}`
+// route (see src/lib/network-rules.ts for the pattern grammar) and the
+// per-request log they write. Mirrored in ai-proxy/prisma/schema.prisma.
+
+enum NetworkRuleAction {
+  BLOCK
+  ALLOW
+}
+
+model NetworkBlockRule {
+  id          String            @id @default(cuid())
+  // Host / path pattern, e.g. `example.com`, `*.example.com`, `example.com/v1/*`, `*`.
+  pattern     String
+  action      NetworkRuleAction @default(BLOCK)
+  enabled     Boolean           @default(true)
+  // Shown to the caller in the 403 body and in the request log.
+  reason      String?
+  createdBy   User?             @relation(fields: [createdById], references: [id], onDelete: SetNull)
+  createdById String?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  @@unique([pattern, action])
+  @@index([enabled])
+}
+
+model NetworkRequestLog {
+  id            String   @id @default(cuid())
+  // Which proxy handled it: "vercel" | "azure".
+  proxy         String
+  method        String
+  host          String
+  // Path only — the query string may carry credentials and is never stored.
+  path          String
+  // "forwarded" | "blocked" (enforce) | "monitored" (would block) | "error".
+  action        String
+  // Upstream status; null when the request never left the proxy.
+  status        Int?
+  ruleId        String?
+  rulePattern   String?
+  // "rule" | "shadow_ai" | "private_address" | "upstream" | "proxy".
+  ruleSource    String?
+  reason        String?
+  userEmail     String?
+  department    String?
+  aiSystemId    String?
+  agentId       String?
+  requestBytes  Int      @default(0)
+  responseBytes Int?
+  durationMs    Int?
+  createdAt     DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([host, createdAt])
+  @@index([action, createdAt])
+}

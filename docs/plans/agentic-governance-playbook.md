@@ -1,0 +1,200 @@
+# Agentic governance lifecycle — closing the loop around the proxy
+
+Source: IBM Think, "Agentic AI governance playbook" (2026). The article's
+thesis is that governing agents means moving "from validating the answer to
+controlling the actions", with controls embedded at runtime rather than
+applied at a single review checkpoint, across a six-phase lifecycle
+(plan/design → data → build → test → deploy/monitor → retire).
+
+Hold already covers the article's **deploy and monitor** phase well: MCP
+server and tool allowlists in monitor/enforce mode, dry-run denials,
+never-seen-tool alerts, proxy-side agent detection, the Discovered Agents
+queue, platform imports, and the heuristic + AI risk review. What is missing
+is the rest of the lifecycle around that runtime control. This plan lists the
+gaps in the article's order and the PRs that close them.
+
+Status legend: ☐ not started · ◐ in progress · ☑ shipped.
+
+## 1. ☑ Kill switch and runtime status gating (PR: `feat/agent-kill-switch`)
+
+The article: "control needs to be continuous and designed"; the autonomous
+agent risk template already told reviewers to "verify kill switches", but
+setting an agent to RETIRED only changed a badge — both proxies loaded only
+the MCP allowlist columns.
+
+Shipped:
+
+- `AIAgent.suspendedAt / suspendedById / suspendedReason` (migration
+  `20260930120000_agent_kill_switch`).
+- `src/lib/agent-runtime-gate.ts` (mirrored into `ai-proxy/src/lib/`, guarded
+  by `check-mirror-drift.mjs`): pure verdict. Suspended → blocked
+  (`agent_suspended`); `status === "RETIRED"` → blocked (`agent_retired`);
+  every other status forwards, including DRAFT (agents registered from the
+  discovery queue start there and must be able to send `x-agent-id`) and
+  DEPRECATED (still running while phased out).
+- Both proxies evaluate the verdict right after attribution, for every
+  provider path (Anthropic, OpenAI, Azure OpenAI, Gemini, Bedrock). A blocked
+  request gets `403 { error: { type: "agent_blocked", violations[] } }` and an
+  enforced `PolicyDenial` row, visible under Compliance → Denials. The gate
+  ignores `mcpEnforcement`. The Azure loader caches agent state for 30 s, so
+  a suspension takes effect within that window there; the Vercel proxy reads
+  per request.
+- `POST / DELETE /api/agents/[id]/suspend` (ADMIN, COMPLIANCE_OFFICER), audit
+  actions `SUSPEND` / `RESUME`, and a Suspend / Resume control plus a
+  "traffic blocked" banner on the agent detail page; a SUSPENDED badge on the
+  registry cards.
+
+Not in scope here: alerts when a suspended agent keeps calling (the denial
+rows already show it), and blocking traffic that carries no `x-agent-id`
+(that is the discovery problem, handled by `docs/plans/agent-discovery.md`).
+
+## 2. ☑ Agent charter and approval gate (PR: `feat/agent-charter-approval`)
+
+The article: define purpose, scope, decision boundaries, access limits, risk
+classification, ownership and approval workflow *before* development, or
+"later controls will just react to problems instead of preventing them".
+
+Today an agent has a description, capabilities, an access-level string and an
+autonomy level. Every governance table (`SystemApproval`, `GovernanceReview`,
+`GovernanceException`, `EvidenceArtifact`, `GovernanceIncident`) keys on
+`aiSystemId` only, so an agent can go DRAFT → DEPLOYED with no sign-off.
+
+Shipped (decision: agent-scoped twin tables, not polymorphic — every existing
+`aiSystem` include and the notifications feed stay non-nullable; the UI is
+shared instead, via an `endpoint` prop on the two reviewer cards):
+
+- Charter on `AIAgent`: `purpose`, `inScopeActions[]`, `outOfScopeActions[]`,
+  `decisionBoundaries`, `successCriteria`; `require*Approval` ×4,
+  `reviewIntervalDays`, `nextReviewDate`. `AgentApproval`,
+  `AgentGovernanceReview` (migration `20260930150000_agent_charter_approval`).
+- `src/lib/agent-governance.ts`: charter status, blockers (hard/soft),
+  workflow summary, checklist. Hard: charter incomplete, suspended,
+  FULL_AUTONOMY without enforce+allowlist, HIGH/CRITICAL with no risk basis
+  (parent assessment or agent risk review), missing stage review, no/overdue
+  review date. Soft: optional charter fields, SUPERVISED without enforcement,
+  human-review contradictions, unapproved observed tools, no parent system.
+- `POST /api/agents/[id]/approval` (refuses APPROVED on hard blockers;
+  approval restarts the review clock), `POST /api/agents/[id]/governance-review`,
+  and the `PUT` gate: no transition into APPROVED/DEPLOYED without an approval.
+- Detail page: checklist, workflow card, charter card, approval + stage
+  review cards. Form: charter and approval-requirement sections.
+
+Deferred to item 4: evidence artifacts for agents and the notifications feed.
+
+## 3. ☑ Structured human-review triggers enforced at the proxy (PR: `feat/agent-review-triggers`)
+
+The article's central claim: "authority limits enforced technically".
+`humanReviewTriggers` is free-text JSON that feeds the AI review and the
+detail page; nothing evaluates it at runtime.
+
+Shipped:
+
+- Grammar in `src/lib/human-review-triggers.ts` (mirrored): `tool`,
+  `tool_argument` (dot path + op + value, numeric coercion), `sensitive_data`
+  (proxy detector over the arguments, optional categories), `note`. Legacy
+  free text is normalised into notes on read and on save.
+- `ObservedToolUse.input` on every path: non-streaming extractors plus
+  streaming accumulators for Anthropic (`input_json_delta`) and OpenAI (chat
+  `tool_calls` fragments, Responses `output_item.done`).
+- Monitor: dry-run `PolicyDenial` (`human_review_required`) + HIGH alert
+  (`human_review_trigger`), `AgentToolCall.reviewRequired` flagged. Enforce:
+  response withheld with 403 `human_review_required`; streams are buffered
+  and either withheld or replayed. Both proxies, Anthropic + OpenAI/Azure
+  OpenAI, streaming and non-streaming. Gemini/Bedrock not yet.
+- Form editor and a Human Review card on the agent page with recent matches;
+  approval gate recommends Enforce for HITL/HOTL agents that only monitor.
+
+Not done: a "pending review" queue where a reviewer approves a withheld call
+and the agent resumes. Today the reviewer acts via the alert (adjust the
+trigger, resume/suspend the agent, re-run). Candidate for item 4.
+
+## 4. ☑ Ownership, escalation, incidents and retirement (PR: `feat/agent-incidents-retirement`)
+
+The article: responsibility split across business, technology and risk roles;
+"well-defined incident response protocols"; "controlled agent and
+infrastructure shutdown … secure disposal … documentation".
+
+Shipped:
+
+- `technicalOwnerId`, `riskOwnerId` (User relations), `escalationContact` on
+  `AIAgent`; Accountability form section + card; soft blockers (risk owner for
+  HIGH/CRITICAL, escalation contact for FULL_AUTONOMY/SUPERVISED); checklist
+  item "Name the accountable people".
+- `GovernanceIncident` made polymorphic (`aiSystemId?` + `agentId?`, CHECK at
+  least one). Agent incident routes + the shared card on the agent page.
+  Open incidents hard-block approval; the alert text points at Suspend.
+- Notifications: agent approvals, overdue agent reviews, agent incidents
+  (linking to the agent) and open human-review trigger alerts.
+- Retirement: `POST /api/agents/[id]/retire` (RETIRED + revoke approval +
+  who/when/notes/attestation), Retire dialog, and a Retirement checklist
+  (stop, confirm quiet for 7 days, close incidents, revoke approval, attest
+  disposal, record). API-key revocation and cross-agent allowlist cleanup
+  were dropped: keys are not modelled per agent and allowlists name MCP
+  servers, not agents. The "final audit export" is the audit trail itself.
+
+Not done (still open): agent evidence artifacts, and a "pending review"
+queue for calls withheld by a review trigger.
+
+## 5. ☑ Behavioural baselines and a shared approved-tool catalog (PR: `feat/agent-baselines-catalog`)
+
+The article: "abnormal pattern identification"; "find and reuse … approved
+agents and tools".
+
+Shipped:
+
+- `AgentBehaviorBaseline` per agent: 28-day stats (requests and tool calls
+  per day, denial/review rate, models, tools, callers, active UTC hours) from
+  `APIUsageLog` (`promptMetadata.agentId`) and `AgentToolCall`; daily cron +
+  on-demand recompute; drift findings (volume/tool-call spike, denial-rate
+  jump = HIGH; new model, new caller, off-hours = MEDIUM) once 7 active days
+  exist; `agent_behavior_drift` alerts feed the notifications bell; Behaviour
+  Baseline card on the agent page.
+- `McpCatalogEntry` org catalog managed on Oversight → MCP Activity, applied
+  at both proxies for agents with `inheritMcpCatalog` (default off for
+  existing agents, on for new ones). Lives in the DB rather than
+  `mcp-server-registry.ts`, which stays the static "recognised servers" list
+  for discovery scoring. Tool lists narrow only agents with their own tool
+  allowlist (reason in the user guide).
+
+Not done: a per-agent "approve for all agents" shortcut from the MCP card.
+
+## 6. ☑ Agent governance posture card (PR: `feat/agent-posture-card`)
+
+Shipped: `src/lib/agent-posture.ts` scores ownership, authority, decision
+making, control, boundaries and responsibilities (0–100 each, weights in the
+user guide) from the fields items 1–5 added; Governance Posture card on the
+agent page with linked gaps; tier badge on registry cards; portfolio
+roll-up (average, tier counts, weakest dimensions, agents needing attention)
+on the Executive page. Descriptive only; the approval gate stays the gate.
+
+## Status
+
+All six items shipped between 2026-09-30 and 2026-10-01 (PRs #156, #159,
+#160 hotfix, #161, #162, #163, #164).
+
+Follow-ups:
+- ☑ Pending review queue (`feat/human-review-queue`): withheld calls become
+  `HumanReviewRequest` rows; reviewers approve (exact-call or trigger-wide
+  waiver) or reject under Oversight → Human Review; both proxies honour
+  waivers when the agent re-runs the call.
+- ☑ Charter scope enforcement (`feat/agent-scope-enforcement`, 2026-10-12):
+  `accessLevel` and `connectedSystems` are enforced at both proxies against
+  org-wide `ToolClassification` rules (name heuristic fallback); monitor /
+  enforce per agent (`scopeEnforcement`), 403 `agent_scope_violation`, never
+  waivable.
+- ☑ Policy check for client-side tools (`POST /api/agent-policy/check`,
+  `GET /api/agent-policy`): the runtime asks before executing its own tools
+  and gets the proxy's verdict (kill switch, allowlists, scope, review
+  triggers with waivers); recorded like proxy traffic.
+- ☐ Agent evidence artifacts.
+- ☐ "Approve for all agents" shortcut on the agent MCP card.
+- ☐ Gemini/Bedrock argument extraction for review triggers.
+
+## Testing and validation (not building)
+
+The article's phase 4 (evaluation under adversarial conditions) is evidence
+Hold should demand, not a harness it should build: allow `EvidenceArtifact`
+on agents with categories for evaluation results, red-team results and
+boundary verification, and make them approval blockers for HIGH/CRITICAL or
+FULL_AUTONOMY agents (folds into item 2). External evaluators produce the
+artifacts.

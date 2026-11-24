@@ -1,0 +1,585 @@
+import { Prisma } from "@prisma/client";
+import { prisma } from "./prisma";
+import { matchDomain, matchDomainHeuristic, type AIToolCategory } from "./ai-tools-registry";
+import { findMatchingGovernedSystem } from "./governed-system-match";
+import { logger } from "./observability";
+import { parseCsv } from "./csv";
+import {
+  dismissedDomainKey,
+  initialDiscoveryObservation,
+  mergeDiscoveryObservation,
+  pickEmails,
+} from "./discovery-merge";
+
+export type LogEntry = {
+  domain: string;
+  user?: string;
+  department?: string;
+  count?: number;
+  /** When the request/query happened (ISO 8601 or any Date-parseable string). */
+  timestamp?: string;
+};
+
+export type IngestResult = {
+  processed: number;
+  matched: number;
+  newTools: number;
+  updatedTools: number;
+  details: { toolName: string; action: string; userCount: number; hits: number }[];
+  ingestionRunId?: string;
+};
+
+export const DNS_PROXY_IMPORT_SOURCES = [
+  { id: "dns_proxy", label: "DNS / Web Proxy", description: "Generic DNS or secure web gateway export." },
+  { id: "umbrella", label: "Cisco Umbrella", description: "Umbrella DNS or activity search export." },
+  { id: "cloudflare_gateway", label: "Cloudflare Gateway", description: "Gateway DNS / HTTP activity export." },
+  { id: "zscaler", label: "Zscaler", description: "ZIA web or DNS log export." },
+  { id: "netskope", label: "Netskope", description: "Netskope web transaction or alert export." },
+  { id: "prisma_access", label: "Palo Alto Prisma Access", description: "Prisma Access / SASE traffic export." },
+  { id: "dnsfilter", label: "DNSFilter", description: "DNSFilter query log export." },
+  { id: "nextdns", label: "NextDNS", description: "NextDNS analytics export." },
+  { id: "firewall", label: "Firewall", description: "Firewall or network security appliance export." },
+  { id: "siem", label: "SIEM Export", description: "Normalized SIEM export with DNS fields." },
+  { id: "other", label: "Other", description: "Fallback parser for custom exports." },
+] as const;
+
+type CsvHeaderPreset = {
+  domain: string[];
+  user: string[];
+  actor: string[];
+  department: string[];
+  count: string[];
+  timestamp: string[];
+};
+
+const DEFAULT_HEADER_PRESET: CsvHeaderPreset = {
+  domain: ["domain", "host", "hostname", "destination", "destination fqdn", "url", "query", "fqdn"],
+  user: ["user", "email", "username", "source_user", "identity", "user email"],
+  actor: ["device name", "device", "computername", "computer name", "client name", "host name"],
+  department: ["department", "dept", "group", "team", "organizational unit"],
+  count: ["count", "hits", "requests", "queries", "repeatcnt"],
+  timestamp: [
+    "timestamp",
+    "@timestamp",
+    "time",
+    "date",
+    "datetime",
+    "date time",
+    "event time",
+    "start time",
+    "receive time",
+    "last seen",
+    "first seen",
+  ],
+};
+
+const SOURCE_HEADER_PRESETS: Record<string, Partial<CsvHeaderPreset>> = {
+  umbrella: {
+    domain: ["domain", "destination", "destination fqdn", "query", "query name", "blocked domain", "fqdn"],
+    user: ["identity", "most granular identity", "user", "user email", "identity name"],
+    actor: ["internalip", "externalip", "device", "computername"],
+    department: ["group", "identity type", "department"],
+  },
+  cloudflare_gateway: {
+    domain: ["host", "hostname", "query name", "destination fqdn", "destination", "url", "domain"],
+    user: ["email", "user", "user email", "identity", "device user"],
+    actor: ["device name", "source ip", "client ip", "client name"],
+    department: ["team", "group", "department"],
+  },
+  zscaler: {
+    domain: ["url", "host", "hostname", "destination host", "destination domain", "fqdn", "domain"],
+    user: ["user", "user name", "login", "email", "source user"],
+    actor: ["location", "client ip", "host", "device name"],
+    department: ["department", "dept", "group", "location"],
+  },
+  netskope: {
+    domain: ["url", "hostname", "domain", "dsthostname", "destination", "destination fqdn"],
+    user: ["user", "user name", "user id", "email"],
+    actor: ["device name", "instance", "client name", "host"],
+    department: ["department", "group", "organizational unit"],
+  },
+  prisma_access: {
+    domain: ["fqdn", "host", "url", "domain", "misc", "destination"],
+    user: ["srcuser", "source user", "user", "user name", "email"],
+    actor: ["serial", "hostname", "device name", "source address", "src"],
+    department: ["group", "department", "source zone"],
+    count: ["repeatcnt", "count", "hits", "sessions"],
+  },
+  dnsfilter: {
+    domain: ["query", "domain", "hostname", "destination", "fqdn"],
+    user: ["user", "username", "user email", "roaming client", "identity"],
+    actor: ["client name", "device name", "source ip"],
+    department: ["group", "policy", "department"],
+  },
+  nextdns: {
+    domain: ["domain", "query", "host", "hostname"],
+    user: ["user", "profile", "email"],
+    actor: ["device name", "client name", "device"],
+    department: ["profile", "department", "group"],
+  },
+};
+
+/**
+ * Reduce the many shapes a DNS/web-proxy export emits for a destination down
+ * to a bare, lowercase hostname so `matchDomain` (which does exact/suffix
+ * comparison) can hit. Proxy logs in particular rarely give a clean domain —
+ * they log full request URLs, `host:port`, wildcard rules, trailing dots, and
+ * trailing annotations, any of which would otherwise defeat the match.
+ *
+ * Handles: full URLs with scheme/path/query, scheme-less `host/path`,
+ * `host:port`, userinfo, `*.` wildcards, leading/trailing dots, `www.`, and
+ * surrounding whitespace. Returns null for empty/unusable input.
+ */
+export function normalizeDomain(raw: string): string | null {
+  if (!raw) return null;
+
+  let value = raw.trim().toLowerCase();
+  if (!value) return null;
+
+  // Some exports wrap the value in quotes or append annotations like
+  // "chat.openai.com (allowed)" — keep only the first whitespace-delimited
+  // token and strip surrounding quotes.
+  value = value.replace(/^["']|["']$/g, "").split(/\s+/)[0] ?? "";
+  // Wildcard policy rules ("*.openai.com") and leading dots (".openai.com").
+  value = value.replace(/^\*+\./, "").replace(/^\.+/, "");
+  if (!value) return null;
+
+  let host: string;
+  try {
+    // Prepending a scheme lets the URL parser handle host:port, paths, query
+    // strings, and userinfo uniformly for scheme-less proxy-log values too.
+    host = new URL(value.includes("://") ? value : `http://${value}`).hostname;
+  } catch {
+    // Malformed enough that the URL parser rejected it — strip manually so we
+    // still recover a usable hostname rather than dropping the entry.
+    host = value
+      .replace(/^[a-z][a-z0-9+.-]*:\/\//, "") // scheme://
+      .split(/[/?#]/)[0] // path / query / fragment
+      .split("@").pop()! // userinfo@
+      .split(":")[0]; // :port
+  }
+
+  host = host.replace(/^www\./, "").replace(/\.$/, "");
+  return host || null;
+}
+
+function normalizeHeader(raw: string) {
+  return raw.trim().toLowerCase().replace(/[_-]+/g, " ");
+}
+
+function findHeaderIndex(headers: string[], aliases: string[]) {
+  return headers.findIndex((header) => aliases.includes(header));
+}
+
+function mergePreset(source: string): CsvHeaderPreset {
+  const specific = SOURCE_HEADER_PRESETS[source] ?? {};
+  return {
+    domain: [...(specific.domain ?? []), ...DEFAULT_HEADER_PRESET.domain],
+    user: [...(specific.user ?? []), ...DEFAULT_HEADER_PRESET.user],
+    actor: [...(specific.actor ?? []), ...DEFAULT_HEADER_PRESET.actor],
+    department: [...(specific.department ?? []), ...DEFAULT_HEADER_PRESET.department],
+    count: [...(specific.count ?? []), ...DEFAULT_HEADER_PRESET.count],
+    timestamp: [...(specific.timestamp ?? []), ...DEFAULT_HEADER_PRESET.timestamp],
+  };
+}
+
+/** Parse a log timestamp; returns null for empty/unparseable values. */
+export function parseLogTimestamp(raw: string | undefined | null): Date | null {
+  const value = (raw ?? "").trim();
+  if (!value) return null;
+  // Epoch seconds / milliseconds (SIEM and firewall exports often emit these).
+  if (/^\d{10}$/.test(value)) return new Date(Number(value) * 1000);
+  if (/^\d{13}$/.test(value)) return new Date(Number(value));
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function parseCount(raw: string | undefined) {
+  const normalized = (raw ?? "").replace(/,/g, "").trim();
+  const parsed = Number.parseInt(normalized, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 1;
+}
+
+export function parseEntriesFromCsv(text: string, source: string = "dns_proxy"): LogEntry[] {
+  const rows = parseCsv(text);
+  if (rows.length === 0) return [];
+
+  const firstRow = rows[0].map((value) => normalizeHeader(value));
+  const preset = mergePreset(source);
+  const hasHeaders =
+    preset.domain.some((header) => firstRow.includes(header)) ||
+    preset.user.some((header) => firstRow.includes(header)) ||
+    preset.actor.some((header) => firstRow.includes(header));
+
+  const entries: LogEntry[] = [];
+
+  if (hasHeaders) {
+    const domainIdx = findHeaderIndex(firstRow, preset.domain);
+    const userIdx = findHeaderIndex(firstRow, preset.user);
+    const actorIdx = findHeaderIndex(firstRow, preset.actor);
+    const deptIdx = findHeaderIndex(firstRow, preset.department);
+    const countIdx = findHeaderIndex(firstRow, preset.count);
+    const timestampIdx = findHeaderIndex(firstRow, preset.timestamp);
+
+    for (const cols of rows.slice(1)) {
+      const domain = domainIdx >= 0 ? normalizeDomain(cols[domainIdx] ?? "") : null;
+      if (!domain) continue;
+
+      const userValue = userIdx >= 0 ? cols[userIdx]?.trim() || undefined : undefined;
+      const actorValue = actorIdx >= 0 ? cols[actorIdx]?.trim() || undefined : undefined;
+      const timestamp = timestampIdx >= 0 ? cols[timestampIdx]?.trim() || undefined : undefined;
+
+      entries.push({
+        domain,
+        user: userValue ?? actorValue,
+        department: deptIdx >= 0 ? cols[deptIdx]?.trim() || undefined : undefined,
+        count: countIdx >= 0 ? parseCount(cols[countIdx]) : 1,
+        // Only present when the export has a time column, so exports without
+        // one keep their existing shape.
+        ...(timestamp ? { timestamp } : {}),
+      });
+    }
+    return entries;
+  }
+
+  for (const row of rows) {
+    const domain = normalizeDomain(row[0] ?? "");
+    if (domain) entries.push({ domain });
+  }
+
+  return entries;
+}
+
+function isUniqueViolation(error: unknown): boolean {
+  return (
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === "P2002"
+  );
+}
+
+async function runIngestion(source: string, entries: LogEntry[]) {
+  const toolMap = new Map<
+    string,
+    {
+      toolName: string;
+      vendor: string;
+      domain: string;
+      users: Set<string>;
+      departments: Set<string>;
+      totalHits: number;
+      /** Earliest/latest row timestamp, when the export carries one. */
+      firstSeen: Date | null;
+      lastSeen: Date | null;
+      matchConfidence: "high" | "low";
+      matchScore: number;
+      matchReasons: string[];
+      /** Registry category; null for heuristic (unknown-tool) candidates. */
+      category: AIToolCategory | null;
+    }
+  >();
+
+  let processed = 0;
+  const ingestedAt = new Date();
+
+  for (const entry of entries) {
+    // Normalize here (not just in the CSV parser) so JSON ingest and the
+    // real-time webhooks — which hand us raw `entry.domain` values straight
+    // from a proxy/SIEM payload — get the same hostname cleanup before
+    // matching. Otherwise a value like "https://chat.openai.com/c/abc" or
+    // "claude.ai:443" silently fails to match a known tool.
+    const normalizedDomain = normalizeDomain(entry.domain);
+    if (!normalizedDomain) continue;
+    processed++;
+
+    // Registry match first (high confidence); otherwise fall back to the
+    // same low-confidence heuristic the Google Workspace scanner uses, so
+    // unknown AI tools seen in DNS/proxy logs surface for review instead of
+    // being silently dropped.
+    const registryMatch = matchDomain(normalizedDomain);
+    const heuristicMatch = registryMatch ? null : matchDomainHeuristic(normalizedDomain);
+    if (!registryMatch && !heuristicMatch) continue;
+
+    const toolName = registryMatch ? registryMatch.toolName : heuristicMatch!.tool.toolName;
+    const vendor = registryMatch ? registryMatch.vendor : heuristicMatch!.tool.vendor;
+    const domain = registryMatch ? registryMatch.domains[0] : heuristicMatch!.tool.domains[0];
+
+    const key = `${toolName}::${domain}`;
+    const existing = toolMap.get(key);
+    const seenAt = parseLogTimestamp(entry.timestamp);
+
+    if (existing) {
+      if (entry.user) existing.users.add(entry.user);
+      if (entry.department) existing.departments.add(entry.department);
+      existing.totalHits += entry.count ?? 1;
+      if (seenAt) {
+        if (!existing.firstSeen || seenAt < existing.firstSeen) existing.firstSeen = seenAt;
+        if (!existing.lastSeen || seenAt > existing.lastSeen) existing.lastSeen = seenAt;
+      }
+      continue;
+    }
+
+    toolMap.set(key, {
+      toolName,
+      vendor,
+      domain,
+      users: new Set(entry.user ? [entry.user] : []),
+      departments: new Set(entry.department ? [entry.department] : []),
+      totalHits: entry.count ?? 1,
+      firstSeen: seenAt,
+      lastSeen: seenAt,
+      matchConfidence: registryMatch ? "high" : "low",
+      matchScore: registryMatch ? 8 : heuristicMatch!.score,
+      matchReasons: registryMatch
+        ? [`domain matched '${registryMatch.domains[0]}'`]
+        : heuristicMatch!.reasons,
+      category: registryMatch ? registryMatch.category : null,
+    });
+  }
+
+  let newTools = 0;
+  let updatedTools = 0;
+  const details: { toolName: string; action: string; userCount: number; hits: number }[] = [];
+
+  for (const discovery of toolMap.values()) {
+    const userCount = Math.max(discovery.users.size, 1);
+    const department =
+      discovery.departments.size > 0
+        ? Array.from(discovery.departments).join(", ")
+        : null;
+
+    // Honor reviewer dismissals from the low-confidence queue, same as the
+    // OAuth scan path — otherwise a dismissed tool reappears on every import.
+    const dismissed = await prisma.dismissedCandidate.findUnique({
+      where: {
+        toolName_detectedDomain: {
+          toolName: discovery.toolName,
+          detectedDomain: dismissedDomainKey(discovery.domain),
+        },
+      },
+    });
+    if (dismissed) continue;
+
+    // Structured observation for this import. Identities that are not email
+    // shaped (device names, bare usernames) still count toward userCount but
+    // are kept out of userEmails. Timestamps come from the rows when the
+    // export has a time column, otherwise the import time stands in.
+    const observation = {
+      detectionSource: source,
+      userCount,
+      userEmails: pickEmails(discovery.users),
+      scopes: [] as string[],
+      firstSeenAt: discovery.firstSeen,
+      lastSeenAt: discovery.lastSeen,
+      observedAt: ingestedAt,
+    };
+
+    const applyUpdate = async (existing: {
+      id: string;
+      detectionSource: string;
+      userCount: number;
+      firstSeenAt: Date | null;
+      lastSeenAt: Date | null;
+      notes: string | null;
+      category: string | null;
+    }) => {
+      // Same-source re-import replaces the count (it may drop); a different
+      // source only raises it. See discovery-merge.ts.
+      const merged = mergeDiscoveryObservation(existing, observation);
+      const line = `DNS/proxy import (${source}): ${discovery.totalHits} hits, ${userCount} user(s).`;
+      await prisma.discoveredAITool.update({
+        where: { id: existing.id },
+        data: {
+          userCount: merged.userCount,
+          userEmails: merged.userEmails,
+          scopes: merged.scopes,
+          firstSeenAt: merged.firstSeenAt,
+          lastSeenAt: merged.lastSeenAt,
+          notes: existing.notes ? `${existing.notes}\n${line}` : line,
+          // Backfill the registry category on legacy rows; never overwrite a
+          // value a reviewer may have set by hand.
+          ...(!existing.category && discovery.category
+            ? { category: discovery.category }
+            : {}),
+        },
+      });
+      updatedTools++;
+      details.push({
+        toolName: discovery.toolName,
+        action: "updated",
+        userCount: merged.userCount,
+        hits: discovery.totalHits,
+      });
+    };
+
+    const existing = await prisma.discoveredAITool.findFirst({
+      where: {
+        toolName: discovery.toolName,
+        detectedDomain: discovery.domain,
+      },
+    });
+
+    if (existing) {
+      await applyUpdate(existing);
+      continue;
+    }
+
+    const governedMatch = await findMatchingGovernedSystem({
+      toolName: discovery.toolName,
+      vendor: discovery.vendor,
+      detectedDomain: discovery.domain,
+    });
+
+    const baseNotes =
+      discovery.matchConfidence === "low"
+        ? `Low-confidence heuristic match from DNS/proxy logs (${source}). ${discovery.totalHits} hits from ${userCount} user(s). Needs review.`
+        : `Detected via DNS/proxy logs (${source}). ${discovery.totalHits} hits from ${userCount} user(s).`;
+
+    const initial = initialDiscoveryObservation(observation);
+
+    let tool;
+    try {
+      tool = await prisma.discoveredAITool.create({
+        data: {
+          toolName: discovery.toolName,
+          vendor: discovery.vendor,
+          detectedDomain: discovery.domain,
+          detectionSource: source,
+          department,
+          userCount: initial.userCount,
+          userEmails: initial.userEmails,
+          scopes: initial.scopes,
+          firstSeenAt: initial.firstSeenAt,
+          lastSeenAt: initial.lastSeenAt,
+          status: governedMatch ? "REGISTERED" : "DISCOVERED",
+          linkedSystemId: governedMatch?.id,
+          matchConfidence: discovery.matchConfidence,
+          matchScore: discovery.matchScore,
+          matchReasons: discovery.matchReasons,
+          category: discovery.category,
+          notes: governedMatch
+            ? `${baseNotes} Suppressed: matches governed system "${governedMatch.name}".`
+            : baseNotes,
+        },
+      });
+    } catch (error) {
+      // A concurrent scan/import created the same (toolName, detectedDomain)
+      // between our findFirst and create — fold into an update instead.
+      if (isUniqueViolation(error)) {
+        const raced = await prisma.discoveredAITool.findFirst({
+          where: {
+            toolName: discovery.toolName,
+            detectedDomain: discovery.domain,
+          },
+        });
+        if (raced) {
+          await applyUpdate(raced);
+          continue;
+        }
+      }
+      throw error;
+    }
+
+    // Alert only on confident matches that aren't already governed.
+    // Low-confidence heuristic candidates go to the review queue silently —
+    // raw DNS logs would otherwise generate an alert for every unknown
+    // .ai domain an employee browses past.
+    if (!governedMatch && discovery.matchConfidence === "high") {
+      await prisma.alert.create({
+        data: {
+          title: `Shadow AI detected: ${discovery.toolName}`,
+          description: `${discovery.toolName} (${discovery.vendor}) detected via ${source} logs. ${discovery.totalHits} requests from ${userCount} user(s).`,
+          severity: discovery.totalHits >= 50 || userCount >= 10 ? "HIGH" : "MEDIUM",
+          source: "shadow_ai",
+          relatedToolId: tool.id,
+        },
+      });
+    }
+
+    newTools++;
+    details.push({
+      toolName: discovery.toolName,
+      action: discovery.matchConfidence === "low" ? "created (needs review)" : "created",
+      userCount,
+      hits: discovery.totalHits,
+    });
+  }
+
+  return {
+    processed,
+    matched: toolMap.size,
+    newTools,
+    updatedTools,
+    details,
+  };
+}
+
+export async function ingestDiscoveredToolEntries(params: {
+  source: string;
+  entries: LogEntry[];
+  inputType: "json" | "csv";
+  fileName?: string | null;
+  triggeredByUserId?: string | null;
+}): Promise<IngestResult> {
+  const run = await prisma.ingestionRun.create({
+    data: {
+      source: params.source,
+      inputType: params.inputType,
+      fileName: params.fileName ?? undefined,
+      triggeredByUserId: params.triggeredByUserId ?? undefined,
+      status: "running",
+    },
+  });
+
+  logger.info("shadow_ai.ingestion.started", {
+    ingestionRunId: run.id,
+    source: params.source,
+    inputType: params.inputType,
+    entries: params.entries.length,
+    fileName: params.fileName ?? null,
+  });
+
+  try {
+    const result = await runIngestion(params.source, params.entries);
+    await prisma.ingestionRun.update({
+      where: { id: run.id },
+      data: {
+        status: "completed",
+        processed: result.processed,
+        matched: result.matched,
+        newTools: result.newTools,
+        updatedTools: result.updatedTools,
+        details: JSON.parse(JSON.stringify({ details: result.details })),
+        completedAt: new Date(),
+      },
+    });
+
+    logger.info("shadow_ai.ingestion.completed", {
+      ingestionRunId: run.id,
+      source: params.source,
+      processed: result.processed,
+      matched: result.matched,
+      newTools: result.newTools,
+      updatedTools: result.updatedTools,
+    });
+
+    return { ...result, ingestionRunId: run.id };
+  } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : "Unknown ingestion error";
+    await prisma.ingestionRun.update({
+      where: { id: run.id },
+      data: {
+        status: "failed",
+        errorMessage,
+        completedAt: new Date(),
+      },
+    });
+
+    logger.error("shadow_ai.ingestion.failed", {
+      ingestionRunId: run.id,
+      source: params.source,
+      error: errorMessage,
+    });
+
+    throw error;
+  }
+}

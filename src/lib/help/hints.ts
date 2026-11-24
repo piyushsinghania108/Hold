@@ -1,0 +1,135 @@
+/**
+ * Named tooltip strings for in-app help hints. Keep entries short — one or
+ * two sentences. Use the matching HelpHint component:
+ *
+ *     <HelpHint hint="autonomy_level" />
+ */
+
+export const HELP_HINTS = {
+  // --- AI System form ---
+  data_sensitivity:
+    "Drives policy evaluation and exposure alerts. Use RESTRICTED for regulated / high-sensitivity data.",
+  review_interval:
+    "How often this system must be re-assessed. The next-review date is computed from this on save.",
+  approval_stages:
+    "Which stages must sign off before the system can be APPROVED. Toggle off stages that aren't required for low-risk systems.",
+
+  // --- Agent form ---
+  autonomy_level:
+    "FULL_AUTONOMY (no human) → SUPERVISED (human monitors) → HUMAN_IN_THE_LOOP (human approves each action) → HUMAN_ON_THE_LOOP (human can override) → MANUAL (human-driven, agent assists).",
+  human_review_triggers:
+    "Conditions that force a human step, evaluated by both proxies against the arguments of every tool call the model makes: any call of a tool, an argument compared to a value (amount > 1000), or arguments containing sensitive data. Notes are informational only.",
+  human_review_enforcement:
+    "Monitor records a dry-run denial and raises a HIGH alert when a trigger matches, but forwards the response. Enforce holds the whole response (streams are buffered), returns 403 human_review_required with a pending review id, and queues the call under Oversight → Human Review; approving there lets the agent through when it re-runs the call.",
+  connected_systems:
+    "The business systems this agent reaches (CRM, Jira, payments…). Used for risk inheritance and, once listed, enforced: a tool classified as reaching a system not named here is out of scope. An empty list is not enforced.",
+  access_level:
+    "The highest kind of tool the agent may call. Every tool is classified read / write / admin (org-wide rules, else by name; unknown names count as write). Read only permits read tools; read write adds write tools; admin permits everything; restricted permits only read tools on the agent's own MCP tool allowlist.",
+  scope_enforcement:
+    "What both proxies do when a tool call exceeds the access level or reaches a system not in Connected systems. Monitor records a dry-run denial and raises a HIGH alert; Enforce withholds the response (403 agent_scope_violation). Scope violations are never queued for review: reclassify the tool or change the charter.",
+  tool_classifications:
+    "Org-wide rules that say what a tool does (read / write / admin) and which system it reaches, keyed by MCP server and tool patterns (`*` any server, `-` tools with no server, globs allowed; most specific wins). Both proxies apply them within a minute. Tools without a rule are classified by name.",
+
+  mcp_governance:
+    "Which MCP servers and tools this agent may use. Observed activity comes from proxy traffic carrying x-agent-id; unlisted tools raise alerts and, in enforce mode, are blocked or hidden.",
+  mcp_allowlist:
+    "Servers match the declared name or URL host (wildcards like *.example.com allowed). Tools are `tool`, `server/tool`, or `server/*`. Empty = observe only.",
+  mcp_enforcement:
+    "Monitor records dry-run denials and alerts. Enforce returns 403 for unlisted servers and narrows each server's allowed_tools so the provider only exposes allowlisted tools.",
+  agent_charter:
+    "Purpose, the actions the agent may and may not take, the limits it must stay within, and how success is measured. Required before approval; reviewers and the AI risk review read it.",
+  agent_approval_stages:
+    "Which stakeholders must sign off before this agent can be approved. Owner, Security and Compliance are on by default; Legal is off. Approval restarts the review interval.",
+  agent_posture:
+    "Six governance-by-design dimensions from the agentic-AI playbook, each 0–100 from this agent's record: Ownership (roles), Authority (enforced allowlists and triggers), Decision making (human review, incidents, drift), Control (argument thresholds, baseline, review cadence), Boundaries (charter, parent, connected systems), Responsibilities (approval, stage reviews, risk basis). Descriptive, not a gate.",
+  mcp_catalog:
+    "Org-wide approved MCP servers (Oversight → MCP Activity). Agents that inherit the catalog get every server here on their allowlist; tool lists narrow only agents that keep their own tool allowlist. Both proxies apply it within a minute.",
+  agent_baseline:
+    "What normal looks like for this agent over the last 28 days of attributed proxy traffic: requests and tool calls per day, denial rate, models, callers and active hours. Recomputed daily; the last 24 hours are compared against it and departures raise agent_behavior_drift alerts once there are 7 active days of history.",
+  agent_accountability:
+    "Business owner (outcomes), technical owner (runs it), risk owner (signs off risk, decides on incidents) and the escalation contact paged when a review trigger fires or an incident opens. Risk owner is recommended for HIGH/CRITICAL agents; escalation contact for agents acting without a human in the loop.",
+  agent_retirement:
+    "Controlled shutdown: Retire sets RETIRED (both proxies refuse the agent's traffic), revokes a standing approval so reactivation goes back through the gate, and records who, when and whether disposal of credentials, data and artifacts was attested.",
+  agent_kill_switch:
+    "Suspend makes both proxies refuse every request carrying this agent's x-agent-id (403, recorded as a denial) until Resume. RETIRED agents are refused the same way. Applies regardless of MCP enforcement mode.",
+
+  // --- Risk assessment ---
+  risk_bias: "Fairness of outputs across groups. Higher = more risk.",
+  risk_security: "Vulnerability to attack, prompt injection, or model misuse. Higher = more risk.",
+  risk_privacy: "Exposure of personal or restricted data. Higher = more risk.",
+  risk_fairness: "Outcome equity and disparate impact. Higher = more risk.",
+  risk_performance: "Reliability and accuracy. Higher = more risk.",
+  risk_transparency: "Explainability and traceability. Higher = more risk.",
+
+  // --- Compliance ---
+  compliance_status:
+    "COMPLIANT and PARTIALLY_COMPLIANT pass approval; NOT_ASSESSED and NON_COMPLIANT block it. Evidence is required.",
+  compliance_evidence:
+    "Free-text describing the controls, testing, or artifacts that back the rating. Reviewers read this at approval time.",
+  policy_enforcement:
+    "ADVISORY flags violations but does not block approval. BLOCKING prevents a system from moving to APPROVED until the violation is resolved.",
+  policy_rules_json:
+    "Machine-evaluable constraints: allowed/blocked vendors, max data sensitivity, required approval stages, model patterns.",
+  framework_controls:
+    "Seeded catalog of NIST AI RMF, ISO 42001, EU AI Act and SOC 2 controls. Coverage counts controls marked Compliant plus those inherited through the crosswalk.",
+  eu_ai_act_classification:
+    "Risk tier under Regulation (EU) 2024/1689 from the classification wizard. Prohibited hard-blocks approval; high-risk pre-creates the applicable articles on the Compliance tab for evidence.",
+  framework_control_status:
+    "A direct assessment of this control for this system. Compliant here also satisfies crosswalked controls in other frameworks; Not Assessed clears the direct rating but keeps any inheritance.",
+
+  // --- Shadow AI ---
+  shadow_ai_status:
+    "DISCOVERED → UNDER_REVIEW → REGISTERED / APPROVED / BLOCKED. Discoveries linked to a governed system are auto-suppressed.",
+  shadow_ai_confidence:
+    "How confident the scanner is that this is the named AI tool, based on name, vendor, domain, and scopes.",
+  shadow_ai_confidence_score:
+    "Numeric match score: 10+ = high, 6–9 = medium, < 6 = low. Based on domain, name, publisher, scope, and app ID signals.",
+  shadow_ai_promote:
+    "Promotes this candidate to the main review queue as a confirmed AI tool with high confidence.",
+  shadow_ai_dismiss:
+    "Permanently removes this candidate and prevents it from resurfacing on future scans. Requires a reason.",
+
+  // --- Alerts / Prompt Risk ---
+  dangerous_prompt:
+    "Proxy-detected risky prompt pattern. Categories include jailbreak, credential extraction, data exfiltration, malware, and unsafe autonomy.",
+  false_positive:
+    "Mark this alert as a benign detection. Optionally create an exception to suppress similar future alerts for the matched categories.",
+  prompt_risk_exception:
+    "A suppression rule that prevents future alerts for a specific prompt risk category. Exceptions match on stable rule keys and can be deactivated.",
+  prompt_risk_signals:
+    "The exact phrases from the user's prompt that matched a detection rule. Sanitized — emails, keys, and long numbers are redacted.",
+  prompt_risk_rules:
+    "The detection engine scans proxy traffic with these rules. Each rule has a stable key (used by exceptions), severity, and regex patterns. Built-in rules can be edited, disabled, or reset to defaults; custom rules can be created or deleted.",
+  prompt_risk_rule_key:
+    "A stable identifier referenced by exceptions (prompt_injection, secret_extraction, etc.). Cannot be changed after creation — rename by creating a new rule and retiring the old one.",
+  prompt_risk_rule_severity:
+    "`critical` produces CRITICAL alerts (credential theft, malware). `warning` produces HIGH alerts (prompt injection, autonomy abuse).",
+  prompt_risk_rule_patterns:
+    "Regex sources matched case-insensitively against user-authored prompt text only. Assistant, tool, and system content are skipped. ReDoS-prone shapes (nested quantifiers) are rejected on save.",
+  prompt_risk_rule_test:
+    "Paste a prompt and dry-run it against the current enabled ruleset without creating an alert. Useful before tightening or loosening detection.",
+
+  // --- Proxy ---
+  proxy_attribution:
+    "Usage is attributed via optional headers: x-user-email (person), x-department (cost center), x-ai-system-id (registry link).",
+  proxy_user_email:
+    "Set PROXY_USER_EMAIL in your shell profile (from git config user.email) so Claude Code usage is attributed to you.",
+  proxy_azure_deployments:
+    "Azure OpenAI paths carry a deployment name, not a model id. Map each deployment to its model (JSON) so usage prices correctly; unmapped deployments price by name.",
+  proxy_bedrock_auth:
+    "Bedrock calls are forwarded with the client's own AWS credentials and only logged. Bedrock API keys (Bearer) work as-is; SigV4 signatures must be computed for the Bedrock host, not the proxy.",
+
+  // --- Oversight ---
+  spend_budget_scope:
+    "PROVIDER (e.g. all OpenAI), AI_SYSTEM (one registered system), or DEPARTMENT.",
+  spend_budget_threshold:
+    "Percent of monthly budget at which a cost_anomaly alert fires (default 80%).",
+  anomaly_multiplier:
+    "Recent usage above (baseline × multiplier) triggers an alert. Higher = less sensitive.",
+  vendor_contract_status:
+    "UNKNOWN → IN_REVIEW → ACTIVE → EXPIRED / TERMINATED. Drives renewal alerts.",
+  vendor_security_review:
+    "NOT_REVIEWED → IN_PROGRESS → APPROVED / CONDITIONAL / REJECTED.",
+} as const;
+
+export type HelpHintKey = keyof typeof HELP_HINTS;

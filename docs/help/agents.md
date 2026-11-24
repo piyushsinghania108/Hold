@@ -1,0 +1,168 @@
+# AI Agents
+
+Agents represent autonomous (or semi-autonomous) behavior layered on top of a system.
+
+## When to register an agent vs. a system
+
+- Register a **system** for the AI capability (e.g. "Claude-based support assistant").
+- Register an **agent** when that capability runs autonomously with defined tools, triggers, or human-review rules. Agents link back to a parent system via **Connected Systems**.
+
+## Governance posture
+
+The **Governance Posture** card scores the six governance-by-design dimensions from IBM's agentic-AI governance playbook, each 0–100 from the agent's own record, with the gaps linked to where they are fixed:
+
+- **Ownership** — business owner, technical owner, risk owner, escalation contact.
+- **Authority** — MCP allowlist in force and enforced; enforceable review triggers declared and enforced.
+- **Decision making** — human-review setting consistent with the autonomy level, triggers declared, no open incidents, mature baseline without drift.
+- **Control** — argument-level thresholds, a mature behaviour baseline, a current review cadence.
+- **Boundaries** — charter (purpose, in-scope, boundaries; out-of-scope and success criteria), parent system, connected systems.
+- **Responsibilities** — approval on record, required stage reviews approved, risk basis.
+
+Overall is the average: **Strong** ≥ 80, **Developing** ≥ 55, otherwise **Weak**. Registry cards carry the badge; **Executive** rolls the portfolio up. The score describes; the approval gate decides.
+
+## Charter and approval
+
+Every agent carries a **charter**: its purpose, the actions it may take (in scope), the actions it must never take (out of scope), the decision boundaries where it has to stop and hand off, and its success criteria. Purpose, at least one in-scope action and the decision boundaries are required before approval; the rest is recommended. Edit it on the agent form; it shows on the **Agent Charter** card.
+
+Approval works like it does for systems. The **Governance checklist** at the top of the detail page lists what is left; the **Governance Workflow** card gives the stage and the next actions; **Stage Reviews** collects the required sign-offs (Owner, Security and Compliance by default, Legal optional — set on the agent form under **Approval Requirements**); **Approval Review** records the decision. Approving sets the agent to APPROVED (a DEPLOYED agent stays DEPLOYED) and restarts the review interval; **Request Changes** and **Revoke** return it to UNDER REVIEW.
+
+Approval is refused while any of these hold:
+
+- the charter is incomplete;
+- the agent is **suspended** (resume it first, or keep it suspended and do not approve);
+- autonomy is **FULL_AUTONOMY** and MCP enforcement is not **Enforce** with at least one allowed server — there is no human to catch a bad tool call;
+- risk is **HIGH** or **CRITICAL** and there is no risk basis: neither a Risk Center assessment on the parent system nor an agent risk review;
+- a required stage review is missing;
+- there is no next-review date, or it has passed.
+
+Softer items (optional charter fields, SUPERVISED without enforcement, human-review settings that contradict the autonomy level, unapproved observed tools, no parent system) are listed as recommendations and do not block.
+
+Moving an agent to **APPROVED** or **DEPLOYED** on the edit form also requires a recorded approval; agents that are already live can be edited freely.
+
+## Autonomy levels
+
+- `FULL_AUTONOMY` — agent acts with no human in the loop. Highest scrutiny.
+- `SUPERVISED` — agent acts, but a human monitors and can intervene.
+- `HUMAN_IN_THE_LOOP` — agent proposes; a human approves every action.
+- `HUMAN_ON_THE_LOOP` — agent acts by default; a human may override during or after.
+- `MANUAL` — human takes every action; the agent only assists.
+
+## Human review triggers
+
+The conditions under which an agent's tool call must stop for a person. Both proxies evaluate them against the **arguments** of every tool call the model makes (`tool_use.input`, OpenAI `function.arguments`, `mcp_call.arguments`), in streaming and non-streaming responses, on the Anthropic, OpenAI and Azure OpenAI paths.
+
+Trigger kinds (agent form → **Human Review Triggers**):
+
+- **Argument condition** — a tool pattern, an argument path (`amount`, `payment.total`, `items.0.sku`) and a comparison: greater than, at least, less than, at most, equals, does not equal, contains, matches regex, is present. Numbers are coerced, so `"$1,200.50"` compares as 1200.5.
+- **Any call of a tool** — the tool pattern alone: `issue_refund`, every tool on the `payments` server, or a name prefix such as `delete_`.
+- **Sensitive data in arguments** — the proxy's sensitive-data detector runs over the call's arguments; optionally restrict to categories such as `pii` or `credentials`.
+- **Note** — free text for reviewers; never evaluated. Triggers written before this release as plain text were kept as notes.
+
+Tool patterns accept a bare tool name (any server), `server/tool`, or a glob with a wildcard for a whole server or a name prefix.
+
+**Enforcement** decides what a match does:
+
+- **Monitor** records a dry-run denial under **Compliance → Denials** (rule `human_review_required`) and raises a **HIGH** alert (source `human_review_trigger`, deduped 24 h per agent and trigger). The response is forwarded.
+- **Enforce** withholds the model's response and returns `403 human_review_required` with the matched trigger, tool and detail in `violations`. The agent loop stops until a person acts. Streaming responses are buffered until the model finishes so the arguments can be checked, so the client waits for the full generation before seeing anything.
+
+Matches are flagged on the tool-call rows (**Oversight → MCP Activity**) and listed on the agent's **Human Review Triggers** card. Gemini and Bedrock traffic is not evaluated yet.
+
+## Pending review queue
+
+In Enforce mode a withheld call also becomes a **pending review** under **Oversight → Human Review**: the agent, the tool, the trigger that matched, and the call's arguments. The `403` the agent received carries the request id. Identical re-runs collapse onto the same request and count up.
+
+A reviewer can **Approve** or **Reject**:
+
+- **Approve this exact call** — a waiver for the same tool and arguments, once, within 24 hours.
+- **Approve any matching call** — a waiver for any call matching the same trigger, up to 10 times in the next hour.
+- **Reject** — the call stays blocked; the agent will be withheld again if it retries.
+
+Nothing is replayed. After an approval the agent (or whoever runs it) re-issues the request; the proxy recognises the waiver, lets the matching call through, and consumes one use. Waivers expire on their own; pending requests expire after 7 days. Both proxies apply waivers, so a decision in the console takes effect at the next call.
+
+## Connecting an agent to the proxy
+
+Governance applies to traffic that reaches a Hold proxy with the agent's id. In the agent's SDK, set the base URL to the proxy (`…/api/proxy/anthropic` or `…/api/proxy/openai/v1`; URLs and the shared secret are on **Settings → Proxy Setup**) and send `x-proxy-key`, `x-agent-id` (from the MCP Tool Governance card) and, optionally, `x-user-email` and `x-department`. The agent keeps its own provider key; the proxy forwards it. Claude Code and Agent SDK runtimes take the same values from `ANTHROPIC_BASE_URL` and `ANTHROPIC_CUSTOM_HEADERS`.
+
+Make the agent handle a `403`: `agent_blocked` (suspended or retired: stop), `policy_denied` (MCP server outside the allowlist or a policy rule: stop and surface the violations), `human_review_required` (a trigger withheld the call: surface `review.id` to a person and retry only after approval under **Oversight → Human Review**), `agent_scope_violation` (the call exceeded the agent's access level or reached a system it is not connected to: stop; a person reclassifies the tool or changes the charter). The full walkthrough is in the user guide under **Connecting an Agent to the Proxy**.
+
+The proxy only governs tools it sees execute (MCP connector and provider tools). An agent that executes its own tools asks **before running one**: `POST /api/agent-policy/check` on the Hold app with `x-proxy-key` and `x-agent-id`, body `{ "tool": "...", "server": "...", "arguments": {...} }` (or `{ "calls": [...] }`). It answers `allow`, `review` (with a pending review id) or `deny`, applying the same kill switch, allowlists, charter scope and review triggers as the proxy, and records the call on the MCP card like proxy traffic. `GET /api/agent-policy` returns the agent's effective policy so a runtime can hide out-of-scope tools up front.
+
+## MCP tool governance
+
+The **MCP Tool Governance** card on the agent detail page shows which MCP servers the agent has declared and which tools its model actually invoked, as seen by the proxy. Traffic is attributed with the `x-agent-id` request header (the agent's id is shown on the card); `x-ai-system-id` still links usage to the parent system.
+
+- **Allowed MCP servers** — server names, URL hosts, or wildcards such as `*.example.com`. Empty means observe only.
+- **Allowed MCP tools** — `tool`, `server/tool`, or `server/*`. Empty means any tool on an allowed server.
+- **Monitor** records a dry-run denial for unlisted servers and raises an alert for unapproved or never-seen tools, but forwards every request.
+- **Enforce** returns `403` for unlisted servers and rewrites each server's `allowed_tools` so the provider only exposes allowlisted tools to the model.
+
+**Approve** on an unapproved row adds it to the allowlist. **Oversight → MCP Activity** shows the same data across all agents.
+
+## Charter scope enforcement
+
+The charter's **Access level** and **Connected systems** are enforced, not just recorded. Both proxies classify every tool the model calls as read, write or admin and attribute it to a system, using the org-wide **Tool classifications** (Oversight → MCP Activity) first and the tool's name otherwise; a name that cannot be placed counts as write until someone classifies it.
+
+- **Read only** permits read tools; **Read write** adds write tools; **Admin** permits everything; **Restricted** permits only read tools that are on the agent's own tool allowlist.
+- Once **Connected systems** is non-empty, a tool classified as reaching any other system is out of scope. An empty list is not enforced.
+- **Scope enforcement** (agent form, next to Access level) is **Monitor** by default: out-of-scope calls are forwarded, recorded as dry-run denials and raise a HIGH `agent_scope` alert. **Enforce** withholds the response (`403 agent_scope_violation`, streams buffered). Scope violations are never queued for human review: reclassify the tool or change the charter.
+
+The MCP Tool Governance card shows each observed tool's classification (and where it came from), whether it is in scope, and the most recent out-of-scope calls. The pencil next to a classification sets an org-wide rule for that tool; the posture score's Authority dimension rewards Enforce.
+
+## Accountability
+
+Four roles per agent: the **business owner** (whoever registered it; accountable for outcomes), a **technical owner** (runs it), a **risk owner** (signs off the risk basis and decides on incidents) and an **escalation contact** (email, Slack channel or pager to page when a review trigger fires or an incident opens). Set them on the agent form under **Accountability**. The approval gate recommends a risk owner for HIGH/CRITICAL agents and an escalation contact for agents that act without a human in the loop; the governance checklist expects both.
+
+## Incidents
+
+**Governance Incidents** on the agent page logs misuse, policy breaches or other governance events against the agent itself (not only its parent system). Opening one raises an alert, hard-blocks the agent's approval until it is resolved or dismissed, and shows in the workflow notifications bell. If the behaviour must stop now, use **Suspend** in the page header; the incident record stays.
+
+## Retirement
+
+**Retire** in the page header is the controlled shutdown. It sets the agent to RETIRED (both proxies refuse its `x-agent-id`), revokes a standing approval so reactivating it means going back through the approval gate, and records who retired it, when, optional notes and whether disposal of credentials, data and artifacts was attested. A **Retirement checklist** appears for DEPRECATED and RETIRED agents: stop the traffic, confirm it has actually stopped (no tool calls in 7 days), close open incidents, revoke the approval, attest disposal, record the retirement.
+
+## Kill switch (Suspend / Resume)
+
+**Suspend** on the agent detail page stops the agent at the proxy: both proxies refuse every request that carries its `x-agent-id` with `403` and record each refusal as an enforced denial under **Compliance → Denials** (rule `agent_suspended`). Traffic that does not carry the header is unaffected, and the agent's status, allowlists and history are untouched. **Resume** clears it. Both actions are audit-logged with the optional reason.
+
+- Applies regardless of the MCP enforcement mode. A kill switch that only recorded would not be one.
+- Agents with status **RETIRED** are refused the same way (rule `agent_retired`); change the status to allow traffic again. DRAFT and DEPRECATED agents are not blocked.
+- The Azure proxy caches agent state for 30 seconds, so a suspension takes effect within that window; the Vercel proxy checks every request.
+- A **Traffic blocked at the proxy** banner shows on the detail page while either condition holds, and a **SUSPENDED** badge on the registry card.
+
+## Behaviour baseline
+
+The **Behaviour Baseline** card shows what normal looks like for the agent over the last 28 days of attributed proxy traffic: requests and tool calls per day, denial and review rates, the models, callers and tools seen, and the hours it is active. A daily job recomputes every agent's baseline and compares the last 24 hours against it; once an agent has 7 active days of history, departures raise `agent_behavior_drift` alerts: request or tool-call volume spikes and denial-rate jumps are HIGH; a new model, a new caller or activity outside the usual hours are MEDIUM. **Recompute** rebuilds the baseline now, for example after a deliberate change in how the agent runs.
+
+## Org-approved MCP catalog
+
+**Oversight → MCP Activity → Approved MCP catalog** lists servers (and optionally tools) approved once for every agent that has **Inherit the org-approved MCP catalog** ticked on its form. Inherited servers show on the agent's MCP card with a dashed "catalog" chip, and both proxies apply the catalog within a minute. Tool lists in the catalog narrow only agents that keep their own tool allowlist; agents without one get every tool on a catalog server. Existing agents do not inherit until the box is ticked; new agents inherit by default.
+
+## Discovered agents
+
+**Agents → Discovered** lists AI agents Hold has seen that nobody registered, with the signals that flagged each one and the tools, MCP servers, models and users observed.
+
+- **Proxy traffic** — hourly, callers of the proxy that send no `x-agent-id` are scored on agent signals: an agent framework in the `User-Agent` (Claude Agent SDK, OpenAI Agents SDK, LangGraph, CrewAI and others), tool calls, MCP tool use, volume and round-the-clock activity. Callers scoring 40+ are queued. Interactive coding assistants such as Claude Code and Cursor are skipped. **Run proxy detection** runs it now.
+- **Endpoints** — the endpoint agent contributes one row per machine and MCP client (for example "Cursor MCP config on alice-mbp") listing the MCP servers configured there, scored higher when a server is an unrecognized remote host or package, a bridge to an unseen remote, or reaches the file system, a shell, a database, a browser, payments or a cloud control plane. Registering a row creates a draft agent whose MCP allowlist is seeded with those servers in monitor mode. Installed agent frameworks appear as a low-confidence row per machine — a lead that someone builds agents there.
+- **Register agent** creates a draft agent from the entry, with observed MCP servers seeded into its allowlist in Monitor mode. Then have the agent send `x-agent-id` so its traffic is governed and attributed.
+- **Start review**, **Approve without registering**, **Mark blocked** and **Reopen** change the review status only. Marking blocked does not stop traffic.
+
+A new entry raises one `agent_discovery` alert; later sightings update it silently.
+
+**Platform imports** also feed the queue:
+
+- **OpenAI Assistants** — after each OpenAI sync. Assistants an earlier release put straight into the registry are linked, not duplicated. OpenAI retired the Assistants API on 2026-08-26.
+- **ChatGPT Enterprise custom GPTs** — with the ChatGPT Enterprise compliance sync: owner, tool types and custom-action domains. The first sync imports without per-GPT alerts.
+- **Anthropic Managed Agents** — a workspace API key on the **Agent Platforms** card in **Settings → Shadow AI**.
+- **Microsoft 365 Copilot / Copilot Studio** — the Microsoft 365 app registration plus the `CopilotPackages.Read.All` application permission and an Agent 365 license. Microsoft-built agents are skipped.
+- **Salesforce Agentforce** — the org's My Domain URL and a connected app with the client credentials flow.
+
+Only metadata is imported — never system prompts, instructions, knowledge or conversations.
+
+## AI-assisted risk review
+
+The **AI Agent Risk Review** card on the agent detail page shows two things side by side:
+
+- A **heuristic** recommended risk level, computed locally from the agent's autonomy, capabilities, and connected systems. It is always present, with no AI call. A **Dedicated review suggested** badge appears when the heuristic thinks the agent warrants a full assessment.
+- An **AI review**, produced on demand with **Generate AI Review** (**Refresh AI Review** once one exists). This calls the configured AI provider with the agent's capabilities, autonomy, triggers, and connected systems, and returns a recommended risk tier, written summary, concerns, and recommendations.
+
+Both are starting points. The human reviewer makes the final call, and a formal risk assessment in the **Risk Center** is what actually sets the agent's recorded risk level.

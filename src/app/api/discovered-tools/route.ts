@@ -1,0 +1,157 @@
+import { NextRequest, NextResponse } from "next/server";
+import { prisma } from "@/lib/prisma";
+import { withAuth, withRole } from "@/lib/auth-guard";
+import { z } from "zod";
+import { createAuditLog } from "@/lib/audit";
+import { findMatchingGovernedSystem } from "@/lib/governed-system-match";
+import { normalizeDirectoryEmail, rollupDepartments } from "@/lib/directory-identity";
+import { isAIToolCategory, resolveToolCategory } from "@/lib/ai-tools-registry";
+import { proxyBlockStats } from "@/lib/network-enforcement";
+import { normalizeDomain } from "@/lib/shadow-blocklist";
+
+const createDiscoveredToolSchema = z.object({
+  toolName: z.string().min(1),
+  vendor: z.string().optional(),
+  detectedDomain: z.string().optional(),
+  detectionSource: z.string().default("manual"),
+  department: z.string().optional(),
+  userCount: z.number().int().min(0).default(0),
+  notes: z.string().optional(),
+});
+
+export async function GET(req: NextRequest) {
+  return withAuth(async () => {
+    // Discoveries that match a governed AISystem are suppressed by default so
+    // they do not clutter the shadow-AI queue. Pass ?includeSuppressed=true to
+    // surface them (e.g. for admin debugging or audit exports).
+    const includeSuppressed =
+      req.nextUrl.searchParams.get("includeSuppressed") === "true";
+    const confidence = req.nextUrl.searchParams.get("confidence");
+    // ?category=<AIToolCategory> narrows to one registry category;
+    // ?category=uncategorized returns rows with no category.
+    const category = req.nextUrl.searchParams.get("category");
+
+    const where: Record<string, unknown> = {};
+    if (!includeSuppressed) where.linkedSystemId = null;
+    if (confidence && ["high", "medium", "low"].includes(confidence)) {
+      where.matchConfidence = confidence;
+    }
+    if (isAIToolCategory(category)) {
+      where.category = category;
+    } else if (category === "uncategorized") {
+      where.category = null;
+    }
+
+    const tools = await prisma.discoveredAITool.findMany({
+      where: Object.keys(where).length > 0 ? where : undefined,
+      orderBy: { detectedAt: "desc" },
+      include: { _count: { select: { alerts: true } } },
+    });
+
+    // Department rollup of each tool's observed users, from the synced
+    // identity-provider directory (DirectoryPerson). One lookup for every
+    // email across all tools; tools with no matches get an empty rollup.
+    const observedEmails = [
+      ...new Set(
+        tools
+          .flatMap((tool) => tool.userEmails)
+          .map((email) => normalizeDirectoryEmail(email))
+          .filter((email): email is string => !!email)
+      ),
+    ];
+    const people =
+      observedEmails.length > 0
+        ? await prisma.directoryPerson.findMany({
+            where: {
+              OR: [{ primaryEmail: { in: observedEmails } }, { aliases: { hasSome: observedEmails } }],
+            },
+            select: { primaryEmail: true, aliases: true, department: true, active: true },
+          })
+        : [];
+
+    // How often the network proxy has denied (or, in monitor mode, would have
+    // denied) each blocked tool's domain recently — the in-path evidence that
+    // a Block is doing something.
+    const blockedDomains = tools
+      .filter((tool) => tool.status === "BLOCKED" && tool.detectedDomain)
+      .map((tool) => tool.detectedDomain as string);
+    const proxyStats = await proxyBlockStats(blockedDomains).catch((err) => {
+      console.error("proxyBlockStats failed:", err);
+      return new Map();
+    });
+
+    return NextResponse.json(
+      tools.map((tool) => {
+        const domain = tool.status === "BLOCKED" ? normalizeDomain(tool.detectedDomain) : null;
+        return {
+          ...tool,
+          departmentRollup:
+            tool.userEmails.length > 0 && people.length > 0
+              ? rollupDepartments(tool.userEmails, people)
+              : null,
+          proxyBlocks: domain ? proxyStats.get(domain) ?? { blocked: 0, monitored: 0, lastAt: null } : null,
+        };
+      })
+    );
+  });
+}
+
+export async function POST(req: NextRequest) {
+  return withRole(["ADMIN", "COMPLIANCE_OFFICER"], async (session) => {
+    const body = await req.json();
+    const parsed = createDiscoveredToolSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json({ error: "Validation failed" }, { status: 400 });
+    }
+
+    const governedMatch = await findMatchingGovernedSystem({
+      toolName: parsed.data.toolName,
+      vendor: parsed.data.vendor,
+      detectedDomain: parsed.data.detectedDomain,
+    });
+
+    // Manual reports carry no registry match; derive the category from the
+    // registry when the reported name or domain is a known tool.
+    const category = resolveToolCategory({
+      toolName: parsed.data.toolName,
+      domain: parsed.data.detectedDomain,
+    });
+
+    const tool = await prisma.discoveredAITool.create({
+      data: governedMatch
+        ? {
+            ...parsed.data,
+            category,
+            status: "REGISTERED",
+            linkedSystemId: governedMatch.id,
+            notes: parsed.data.notes
+              ? `${parsed.data.notes}\nSuppressed: matches governed system "${governedMatch.name}".`
+              : `Suppressed: matches governed system "${governedMatch.name}".`,
+          }
+        : { ...parsed.data, category },
+    });
+
+    // Only alert on genuinely new shadow AI — suppress when the tool is
+    // already registered as a governed AISystem.
+    if (!governedMatch) {
+      await prisma.alert.create({
+        data: {
+          title: `New AI tool discovered: ${tool.toolName}`,
+          description: `${tool.toolName} was detected via ${tool.detectionSource}${tool.department ? ` in ${tool.department}` : ""}`,
+          severity: "MEDIUM",
+          source: "shadow_ai",
+          relatedToolId: tool.id,
+        },
+      });
+    }
+
+    await createAuditLog({
+      userId: session.user.userId,
+      action: "CREATE",
+      entityType: "DiscoveredAITool",
+      entityId: tool.id,
+    });
+
+    return NextResponse.json(tool, { status: 201 });
+  });
+}

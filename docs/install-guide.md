@@ -1,0 +1,1138 @@
+# Hold Install Guide
+
+This guide walks through installing Hold from zero — local development, production deployment on Vercel, the companion Azure Functions API proxy, and every external integration (Google, Microsoft, Anthropic, OpenAI, and Google Gemini / Vertex AI oversight).
+
+For day-to-day product usage once installed, see the [User Guide](./user-guide.md). For architecture, see the [Implementation Guide](./implementation-guide.md).
+
+---
+
+## Table of Contents
+
+1. [Prerequisites](#1-prerequisites)
+2. [Local Development Install](#2-local-development-install)
+3. [Environment Variables Reference](#3-environment-variables-reference)
+4. [Database Setup](#4-database-setup)
+5. [First Run & First Admin User](#5-first-run--first-admin-user)
+6. [Production Deployment (Vercel)](#6-production-deployment-vercel)
+7. [API Proxy Deployment (Azure Functions)](#7-api-proxy-deployment-azure-functions)
+8. [Integration Setup](#8-integration-setup)
+9. [Background Cron Setup](#9-background-cron-setup)
+10. [Upgrades & Migrations](#10-upgrades--migrations)
+11. [Uninstall / Reset](#11-uninstall--reset)
+12. [Troubleshooting](#12-troubleshooting)
+
+---
+
+## 1. Prerequisites
+
+### Required
+
+| Tool | Version | Purpose |
+|------|---------|---------|
+| **Node.js** | 20.x or later | Next.js 16 + React 19 require Node 20+. |
+| **npm** | 10.x (bundled with Node 20) | Package manager. |
+| **PostgreSQL** | 14+ (16 recommended) | Primary database. |
+| **Git** | any recent | Clone the repo. |
+
+### Recommended
+
+| Tool | Purpose |
+|------|---------|
+| **Homebrew** (macOS) | Easiest way to install Postgres locally. |
+| **Vercel CLI** (`npm i -g vercel`) | Deploying to Vercel. |
+| **Azure Functions Core Tools v4** | Running / deploying the `ai-proxy/` companion. |
+| **Azure CLI** | Authenticating with Azure for the proxy deploy. |
+| **`openssl`** | Generating random secrets. |
+
+### Quick environment check
+
+```bash
+node --version      # should print v20.x or newer
+npm --version       # should print 10.x or newer
+psql --version      # should print 14+ or newer
+git --version
+```
+
+---
+
+## 2. Local Development Install
+
+### 2.1 Clone the repo
+
+```bash
+git clone <your-repo-url> hold
+cd hold
+```
+
+### 2.2 Install dependencies
+
+```bash
+npm install
+```
+
+This runs the `postinstall` script, which executes `prisma generate` against `prisma/schema.prisma`. If it fails, see [Troubleshooting](#12-troubleshooting).
+
+> **Note**: the `ai-proxy/` directory is a separate project with its own `package.json`. It is **not** installed by the root `npm install` — install it separately only if you plan to run the proxy locally (see [Section 7](#7-api-proxy-deployment-azure-functions)).
+
+### 2.3 Start PostgreSQL locally
+
+**macOS (Homebrew):**
+```bash
+brew install postgresql@16
+brew services start postgresql@16
+createdb hold_dev
+```
+
+**Ubuntu / Debian:**
+```bash
+sudo apt install postgresql
+sudo -u postgres createdb hold_dev
+sudo -u postgres createuser --superuser $USER   # once
+```
+
+**Docker (cross-platform alternative):**
+```bash
+docker run --name hold-postgres -e POSTGRES_PASSWORD=postgres \
+  -e POSTGRES_DB=hold_dev -p 5432:5432 -d postgres:16
+```
+
+### 2.4 Create `.env`
+
+Copy `.env.example` if present, or create a new `.env` at the repo root:
+
+```bash
+cat > .env <<'EOF'
+# --- Database ---
+DATABASE_URL="postgresql://$USER@localhost:5432/hold_dev?schema=public"
+
+# --- Auth ---
+NEXTAUTH_URL=http://localhost:3001
+NEXTAUTH_SECRET=__replace__
+
+# --- Encryption for stored secrets ---
+SETTINGS_ENCRYPTION_KEY=__replace__
+
+# --- Optional: dev login ---
+ENABLE_DEV_LOGIN=true
+ENABLE_LOCAL_AUTH=true
+
+# --- Optional: demo mode (loads the seeded sample workspace) ---
+DEMO_MODE=true
+NEXT_PUBLIC_DEMO_MODE=true
+
+# --- Cron ---
+CRON_SECRET=__replace__
+EOF
+```
+
+Generate strong secrets:
+
+```bash
+openssl rand -hex 32   # use for NEXTAUTH_SECRET
+openssl rand -hex 32   # use for SETTINGS_ENCRYPTION_KEY
+openssl rand -hex 32   # use for CRON_SECRET
+```
+
+> **Important**: `SETTINGS_ENCRYPTION_KEY` encrypts provider keys, service-account JSON, and client secrets stored in the `AppSetting` table. **Do not rotate it after data has been saved** — you will lose access to previously-stored encrypted values. Back up the key alongside database backups.
+
+Full variable reference in [Section 3](#3-environment-variables-reference).
+
+### 2.5 Run migrations and seed
+
+```bash
+npm run db:migrate    # applies all Prisma migrations
+npm run db:seed       # loads demo workspace (requires DEMO_MODE=true for realistic data)
+```
+
+### 2.6 Start the dev server
+
+```bash
+npm run dev
+```
+
+The app listens on **http://localhost:3001** by default (Next.js 16 + Turbopack).
+
+### 2.7 Sign in
+
+With the default demo seed you can sign in at `/login` as:
+
+- Email: `admin@example.com`
+- Password: `demo-password`
+
+(This requires `ENABLE_DEV_LOGIN=true` + `ENABLE_LOCAL_AUTH=true`.)
+
+---
+
+## 3. Environment Variables Reference
+
+All variables read from `.env` in local dev and from the platform environment (Vercel, Azure) in production.
+
+### 3.1 Required
+
+| Variable | Purpose |
+|----------|---------|
+| `DATABASE_URL` | Postgres connection string. Must include `?schema=public`. |
+| `NEXTAUTH_URL` | Public base URL of the Hold app (`http://localhost:3001` in dev). |
+| `NEXTAUTH_SECRET` | Signs NextAuth session tokens. 32+ random bytes. |
+| `SETTINGS_ENCRYPTION_KEY` | AES key for encrypting secret `AppSetting` values. 32+ random bytes. |
+
+### 3.2 Recommended
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `CRON_SECRET` | Bearer token for the maintenance endpoint and every `/api/cron/*` job. | — |
+| `PROXY_SECRET` | Shared secret for the AI proxy (`ai-proxy/`). | — |
+| `NETWORK_PROXY_MODE` | General network proxy (`/api/proxy/net/…`) mode: `off`, `monitor` or `enforce`. The `network_proxy_mode` setting (Settings → Proxy Setup) takes precedence. Set the same value on the Azure Function App. | `off` |
+| `PROMPT_HASH_SALT` | HMAC salt for the dangerous-prompt correlation hash (also settable as the `prompt_hash_salt` setting). Falls back to `NEXTAUTH_SECRET`. Set the same value on the Azure proxy so hashes match across surfaces. Only the hash is stored, never the prompt or the salt. Also keys the caller-credential hash that agent discovery groups proxy traffic by, so changing it (or letting the two proxies disagree) makes every proxy caller look new and re-queues them under Agents → Discovered. | `NEXTAUTH_SECRET` |
+
+### 3.3 Auth providers (optional — can also live in Settings UI)
+
+| Variable | Purpose |
+|----------|---------|
+| `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | Google OAuth for sign-in. |
+| `MICROSOFT_TENANT_ID`, `MICROSOFT_CLIENT_ID`, `MICROSOFT_CLIENT_SECRET` | Microsoft / Entra ID sign-in. |
+| `ENABLE_DEV_LOGIN` | `true` to allow local credentials login. Must be `false` in production (app fails fast if `true` in prod). |
+| `ENABLE_LOCAL_AUTH` | `true` to allow password-backed local accounts. |
+
+### 3.4 Provider fallbacks
+
+| Variable | Purpose |
+|----------|---------|
+| `ANTHROPIC_API_KEY` | Fallback Claude key if `ai_provider=anthropic` and no key is set in Settings. |
+| `OPENAI_API_KEY` | Fallback OpenAI key if `ai_provider=openai` and no key is set in Settings. |
+
+### 3.5 Google Gemini / Vertex AI oversight fallback
+
+| Variable | Purpose |
+|----------|---------|
+| `GEMINI_BILLING_SERVICE_ACCOUNT_KEY` | Full Google service-account JSON for BigQuery billing-export reads. Prefer Settings UI. |
+| `GEMINI_BILLING_PROJECT_ID` | Google Cloud project containing the billing export. |
+| `GEMINI_BILLING_DATASET` | BigQuery dataset for the billing export table. |
+| `GEMINI_BILLING_TABLE` | BigQuery table containing Gemini / Vertex AI billing rows. |
+| `GEMINI_BILLING_LOCATION` | BigQuery location, usually `US` or `EU`. |
+
+### 3.6 Google Workspace shadow-AI fallback
+
+| Variable | Purpose |
+|----------|---------|
+| `GOOGLE_SERVICE_ACCOUNT_KEY` | Full service-account JSON (stringified). Prefer Settings UI. |
+| `GOOGLE_ADMIN_EMAIL` | Workspace super-admin for domain-wide delegation impersonation. |
+| `GOOGLE_SCAN_ENABLED` | `true` / `false`. |
+| `GOOGLE_SCAN_LOOKBACK_DAYS` | Default 30. |
+| `GOOGLE_SCAN_INTERVAL_HOURS` | Default 24. |
+| `DIRECTORY_SYNC_GOOGLE_WORKSPACE_ENABLED` | `true` / `false` (default `false`). Daily people-directory sync into `DirectoryPerson`; reuses the service account above and additionally needs the `admin.directory.user.readonly` scope (see 8.3). |
+| `DIRECTORY_SYNC_GOOGLE_WORKSPACE_INTERVAL_HOURS` | Default 24. |
+
+### 3.7 Microsoft 365 shadow-AI fallback
+
+| Variable | Purpose |
+|----------|---------|
+| `MICROSOFT_SHADOW_AI_TENANT_ID` | Entra tenant ID. |
+| `MICROSOFT_SHADOW_AI_CLIENT_ID` | Entra app client ID. |
+| `MICROSOFT_SHADOW_AI_CLIENT_SECRET` | Entra app client secret. |
+| `MICROSOFT_SHADOW_AI_SCAN_ENABLED` | `true` / `false`. |
+| `MICROSOFT_SHADOW_AI_SCAN_INTERVAL_HOURS` | Default 24. |
+| `DIRECTORY_SYNC_MICROSOFT_365_ENABLED` | `true` / `false` (default `false`). Daily people-directory sync from Graph `/users` into `DirectoryPerson`; reuses the tenant app above and needs `User.Read.All` (see 8.4). |
+| `DIRECTORY_SYNC_MICROSOFT_365_INTERVAL_HOURS` | Default 24. |
+| `DIRECTORY_SYNC_INCLUDE_GUESTS` | `true` to sync guest accounts (`#EXT#` in the UPN); default skips them. |
+
+### 3.8 Hexnode UEM shadow-AI fallback
+
+| Variable | Purpose |
+|----------|---------|
+| `HEXNODE_SUBDOMAIN` | Your Hexnode tenant subdomain. |
+| `HEXNODE_API_KEY` | Hexnode API key. Prefer Settings UI. |
+| `HEXNODE_SCAN_ENABLED` | `true` / `false`. |
+| `HEXNODE_SCAN_INTERVAL_HOURS` | Default 24. |
+
+### 3.9 CrowdStrike Falcon shadow-AI fallback
+
+| Variable | Purpose |
+|----------|---------|
+| `CROWDSTRIKE_BASE_URL` | Falcon API base URL for your cloud region. |
+| `CROWDSTRIKE_CLIENT_ID` | Falcon API client ID. |
+| `CROWDSTRIKE_CLIENT_SECRET` | Falcon API client secret. Prefer Settings UI. |
+| `CROWDSTRIKE_SCAN_ENABLED` | `true` / `false`. |
+| `CROWDSTRIKE_SCAN_INTERVAL_HOURS` | Default 24. |
+
+### 3.10 Shadow-AI blocklist feed
+
+| Variable | Purpose |
+|----------|---------|
+| `SHADOW_AI_BLOCKLIST_TOKEN` | Bearer token for `GET /api/discovered-tools/blocklist`, the denylist of `BLOCKED` tool domains that an external DNS / proxy / firewall / CASB polls to enforce blocks. |
+
+> The feed **fails closed**. With no token configured the endpoint returns `503` rather than serving an unauthenticated list of the AI tools your organization blocks.
+
+### 3.10a Agent platform imports fallback
+
+These back the **Settings → Shadow AI → Agent Platforms** card (the `agent_platforms` discovery-scan source). Settings UI values win; secrets saved there are encrypted with `SETTINGS_ENCRYPTION_KEY`.
+
+| Variable | Purpose |
+|----------|---------|
+| `AGENT_PLATFORMS_SCAN_ENABLED` | `true` / `false` (default `false`). Scheduled import of Anthropic Managed Agents, Microsoft Copilot agents and Salesforce Agentforce agents. |
+| `AGENT_PLATFORMS_SCAN_INTERVAL_HOURS` | Default 24. |
+| `ANTHROPIC_MANAGED_AGENTS_API_KEY` | A regular API key (`sk-ant-api…`) from the Claude Platform workspace whose Managed Agents you want listed. Admin keys are rejected by `GET /v1/agents`. Prefer Settings UI. |
+| `MICROSOFT_COPILOT_AGENTS_ENABLED` | `true` to import Microsoft 365 Copilot / Copilot Studio agents with the Microsoft 365 app registration from §3.7. Needs `CopilotPackages.Read.All` (see §8.4a). |
+| `SALESFORCE_INSTANCE_URL` | The org's My Domain URL, e.g. `https://acme.my.salesforce.com`. Only `*.salesforce.com`, `*.force.com` and `*.salesforce.mil` hosts are accepted; `login.salesforce.com` / `test.salesforce.com` are rejected (client credentials needs My Domain). |
+| `SALESFORCE_CLIENT_ID` | Connected app consumer key. |
+| `SALESFORCE_CLIENT_SECRET` | Connected app consumer secret. Prefer Settings UI. |
+
+OpenAI Assistants and ChatGPT Enterprise custom GPTs need no extra variables: they are imported with the OpenAI and ChatGPT Enterprise provider syncs (§8.6, §8.6b).
+
+### 3.11 AI gateway telemetry fallbacks
+
+Use these when traffic already flows through a gateway and you want its records without re-routing through the Hold proxy.
+
+| Variable | Purpose |
+|----------|---------|
+| `OPENROUTER_PROVISIONING_KEY` | OpenRouter provisioning key for activity reads. |
+| `HELICONE_API_KEY`, `HELICONE_API_BASE_URL` | Helicone request telemetry. |
+| `PORTKEY_API_KEY`, `PORTKEY_API_BASE_URL` | Portkey analytics. |
+| `PORTKEY_WORKSPACE_SLUG` | Only needed for a non-default Portkey workspace. |
+| `LITELLM_API_KEY`, `LITELLM_API_BASE_URL` | LiteLLM proxy telemetry. |
+| `CHATGPT_ENTERPRISE_ADMIN_KEY`, `CHATGPT_WORKSPACE_ID` | ChatGPT Enterprise Compliance API: workspace-scoped Admin key (created by a workspace owner) and the workspace id. Usually set in the Integrations UI instead. |
+| `ANTHROPIC_COMPLIANCE_KEY` | Anthropic Compliance API. A Compliance Access Key (`sk-ant-api01-…`) with `read:compliance_activities`, plus `read:compliance_user_data` for Claude app session metadata. Optional: the Admin API key serves the activity feed on its own. |
+| `ANTHROPIC_ANALYTICS_KEY` | Claude Enterprise Analytics API key with `read:analytics` (per-user activity, DAU/WAU/MAU, seats, per-user cost). Enterprise plans only. |
+| `ORG_TIMEZONE` | IANA timezone for the "API key created outside 07:00–19:00" compliance alert. Default `UTC`. |
+| `ANTHROPIC_COMPLIANCE_LOOKBACK_DAYS` | How far a page-capped first compliance-feed pull keeps backfilling. Default 30. |
+
+### 3.12 Developer-AI telemetry ingest
+
+Shared secrets for the OpenTelemetry ingest routes that feed the Claude Code, Cowork, and Cursor dashboards.
+
+| Variable | Purpose |
+|----------|---------|
+| `CLAUDE_CODE_TELEMETRY_SECRET` | Bearer token for `POST /api/telemetry/claude-code`. |
+| `ENDPOINT_AGENT_ENROLLMENT_SECRET` | Org-wide secret the endpoint agent trades once for a per-device token. Prefer setting it in Settings → Endpoint Agent (encrypted at rest); the env var is the fallback. It is low-value by design — it can enroll a device and nothing else. |
+| `CURSOR_TELEMETRY_SECRET` | Bearer token for `POST /api/telemetry/cursor`. |
+| `CLAUDE_CODE_TELEMETRY_RETENTION_DAYS` | Retention window (days) enforced by the Claude Code prune cron. Default 30. |
+| `CURSOR_TELEMETRY_RETENTION_DAYS` | Retention window (days) enforced by the Cursor prune cron. Default 30. |
+| `TELEMETRY_MAX_ROWS` | Ceiling on flattened rows per ingest request (default `5000`); larger bodies get `413`. |
+
+Retention for the other collection tables is enforced by `/api/cron/prune-collection` (§9.2). Set it in **Settings → General → Data Retention**, or via these env fallbacks (days; `0` disables pruning for that table). Usage and cost buckets are the long-term aggregate and are never pruned.
+
+| Variable | Table | Default |
+|----------|-------|---------|
+| `API_USAGE_LOG_RETENTION_DAYS` | `APIUsageLog` (per-request proxy log; buckets keep the totals) | 180 |
+| `AGENT_TOOL_CALL_RETENTION_DAYS` | `AgentToolCall` (tool profiles keep the counts) | 180 |
+| `POLICY_DENIAL_RETENTION_DAYS` | `PolicyDenial` | 365 |
+| `RAW_SNAPSHOT_RETENTION_DAYS` | `ProviderRawSnapshot` | 14 |
+| `PROXY_HEALTH_RETENTION_DAYS` | `ProxyHealthSnapshot` | 90 |
+| `SCAN_RESULT_RETENTION_DAYS` | `SensitiveScan`, `ProviderSecurityScan` (newest run per provider is always kept) | 365 |
+| `COMPLIANCE_ACTIVITY_RETENTION_DAYS` | `ComplianceActivity` (auth / admin-audit events from provider compliance feeds; the upstream platform keeps 30 days) | 365 |
+| `NETWORK_REQUEST_LOG_RETENTION_DAYS` | `NetworkRequestLog` (per-request rows from the general network proxy: host, path, verdict, status, bytes; no bodies or query strings) | 90 |
+
+### 3.13 Scheduled report delivery
+
+| Variable | Purpose |
+|----------|---------|
+| `RESEND_API_KEY` | Resend API key for emailing scheduled reports. |
+| `REPORT_EMAIL_FROM` | From address on scheduled report emails. |
+
+> Without these, report schedules save but never send.
+
+### 3.14 Observability
+
+| Variable | Purpose |
+|----------|---------|
+| `DATADOG_API_KEY`, `DATADOG_APP_KEY` | Datadog credentials. |
+| `DATADOG_SITE` | Datadog site, e.g. `datadoghq.com`. |
+| `DATADOG_ENABLED` | `true` / `false`. |
+
+> **Azure Monitor** (which powers the Proxy Health board's platform metrics) has **no env fallback** — configure its subscription ID, resource group, and function app name in the Settings UI.
+
+### 3.15 Sync, anomaly, and governance tuning
+
+All optional; the Settings UI is the normal place to change these.
+
+| Variable | Purpose |
+|----------|---------|
+| `PROVIDER_SYNC_ENABLED`, `PROVIDER_SYNC_INTERVAL_HOURS` | Provider telemetry sync toggle and cadence. One global switch covers every provider and gateway sync; per-provider schedules are planned ([Tier 2 plan](./plans/data-collection-tier2.md)). |
+| `PROVIDER_SYNC_OVERLAP_DAYS` | Default 2. Days re-pulled before each provider's sync watermark on every scheduled run so late-arriving usage and cost corrections are captured. Also settable as `provider_sync_overlap_days` in Settings. |
+| `PROVIDER_SECURITY_SCAN_ENABLED`, `PROVIDER_SECURITY_SCAN_INTERVAL_HOURS` | Provider secure-use / privacy scan toggle and cadence. |
+| `ANOMALY_RECENT_WINDOW_DAYS`, `ANOMALY_BASELINE_WINDOW_DAYS` | Comparison windows for cost / usage anomaly detection. |
+| `ANOMALY_MIN_RECENT_TOKENS`, `ANOMALY_MIN_RECENT_COST` | Floors that suppress anomaly alerts on trivial volume. |
+| `ANOMALY_PROVIDER_MULTIPLIER`, `ANOMALY_PROJECT_MULTIPLIER`, `ANOMALY_MODEL_MULTIPLIER` | Per-dimension sensitivity multipliers. |
+| `GOVERNANCE_REVIEW_NOTICE_DAYS` | Days ahead of a due review to raise a reassessment alert. |
+| `GOVERNANCE_EXCEPTION_NOTICE_DAYS` | Days ahead of exception expiry to raise a renewal alert. |
+| `GOVERNANCE_ESCALATION_OVERDUE_DAYS` | Days overdue before a review escalates. |
+
+### 3.16 Demo mode
+
+| Variable | Purpose |
+|----------|---------|
+| `DEMO_MODE` | Server-side demo behavior. |
+| `NEXT_PUBLIC_DEMO_MODE` | Shows the demo banner in the UI. |
+
+> **Precedence**: If a setting exists in both the `AppSetting` table (via Settings UI) and env vars, the **database value wins**. Env vars are the fallback when the DB value is absent.
+
+---
+
+## 4. Database Setup
+
+Hold uses Prisma ORM and PostgreSQL. The schema is in `prisma/schema.prisma`; migrations live in `prisma/migrations/`.
+
+### 4.1 Choosing a database
+
+| Environment | Recommended |
+|-------------|-------------|
+| Local dev | Homebrew / Docker Postgres. |
+| Production | **Azure Database for PostgreSQL (Flexible Server)**, Neon, Supabase, or any managed Postgres 14+. |
+| Self-hosted | PostgreSQL 14+ with SSL. |
+
+> **Note**: Prisma Accelerate (`db.prisma.io`) is **not** recommended. The platform has strict plan limits that can result in production outages when tripped. Use a directly-managed Postgres instance instead.
+
+### 4.2 Connection string format
+
+```
+postgresql://<user>:<password>@<host>:<port>/<database>?schema=public&sslmode=require
+```
+
+- Add `&sslmode=require` for managed providers.
+- Use a **dedicated database** per environment (dev / staging / prod).
+
+### 4.2.1 Connection pooling (serverless)
+
+Serverless platforms (Vercel, Azure Functions) spawn many short-lived isolates, each of which opens its own Prisma pool. Without a server-side pooler, the database connection cap is easy to exhaust. Two approaches:
+
+**Option A: App-side connection_limit (small deployments)**
+
+`src/lib/prisma.ts` appends `connection_limit=1&pool_timeout=15` to the URL. With a managed Postgres that allows ~100 concurrent connections, this supports ~90 concurrent Vercel isolates before contention. Good for demo / small production workloads.
+
+**Option B: Server-side pooler (recommended for production)**
+
+Use a transaction-mode pooler (PgBouncer) in front of Postgres. Point `DATABASE_URL` at the pooler port (6432 on Azure PG Flexible Server GP/MO tiers) and set `DIRECT_URL` to the direct database port (5432) for migrations and introspection:
+
+```
+DATABASE_URL=postgresql://user:pass@host:6432/db?sslmode=require&pgbouncer=true
+DIRECT_URL=postgresql://user:pass@host:5432/db?sslmode=require
+```
+
+- `pgbouncer=true` tells Prisma to disable prepared statements (required for PgBouncer transaction pool mode).
+- `DIRECT_URL` is declared in `prisma/schema.prisma` as `directUrl = env("DIRECT_URL")`. Prisma uses it automatically for `prisma migrate deploy`, `prisma db pull`, and other session-level commands that PgBouncer transaction mode can't handle.
+
+On Azure PG Flexible Server:
+
+```bash
+# Enable PgBouncer (requires GeneralPurpose or MemoryOptimized tier — NOT Burstable)
+az postgres flexible-server parameter set --server-name <srv> --resource-group <rg> \
+  --name pgbouncer.enabled --value true
+
+# Recommended: allow common driver startup params
+az postgres flexible-server parameter set --server-name <srv> --resource-group <rg> \
+  --name pgbouncer.ignore_startup_parameters --value "extra_float_digits,search_path"
+
+# Sanity-check: `pool_mode` defaults to `transaction`; `max_client_conn` to 5000.
+```
+
+### 4.3 Running migrations
+
+```bash
+# Apply all pending migrations
+npm run db:migrate
+
+# Create a new migration after editing schema.prisma (dev only)
+npx prisma migrate dev --name describe_change
+
+# Regenerate Prisma client (sometimes required after schema changes)
+npx prisma generate
+
+# Reset DB (destructive — wipes data, re-runs all migrations, re-seeds)
+npm run db:reset
+```
+
+In production (Vercel), migrations run automatically during the build via `prisma migrate deploy` if you wire it into the build step, **or** you can run them manually:
+
+```bash
+DATABASE_URL="<prod-url>" npx prisma migrate deploy
+```
+
+### 4.4 Seeding
+
+`npm run db:seed` runs `prisma/seed.ts`. With `DEMO_MODE=true` it loads a rich demo workspace (AI systems, policies, discovered tools, telemetry); without it, it creates the minimum baseline (admin user + default policies).
+
+---
+
+## 5. First Run & First Admin User
+
+### 5.1 If using Google OAuth (recommended for real installs)
+
+1. Complete the [Google OAuth integration setup](#81-google-oauth-sign-in).
+2. Start the app.
+3. Set `ALLOWED_SIGN_IN_DOMAINS` (comma-separated email domains allowed to create accounts) and `INITIAL_ADMIN_EMAIL` (the first `ADMIN`, promoted only while no active admin exists). In production, without an allowlist, new SSO accounts are refused. Later sign-ins default to `VIEWER` and must be promoted by an admin.
+
+### 5.2 If using dev credentials
+
+- The seed creates `admin@example.com` / `demo-password` with `ADMIN` role.
+- Only works when `ENABLE_DEV_LOGIN=true` **and** `ENABLE_LOCAL_AUTH=true`.
+- Must be disabled in production (`ENABLE_DEV_LOGIN=false`).
+
+### 5.3 Verifying the install
+
+After logging in as an admin, check:
+
+- **Dashboard** loads with seeded stats (if demo mode).
+- **Settings → General** is reachable.
+- **Settings → Users & Identity** shows your user with role `ADMIN`.
+- Try creating a test AI system from **Registry → Register AI System**.
+
+---
+
+## 6. Production Deployment (Vercel)
+
+The main Next.js app is designed for Vercel. Other Node-compatible hosts (Fly.io, Render, self-hosted) will work but are not covered here.
+
+### 6.1 One-time setup
+
+1. **Create a Vercel project** linked to your Git repo.
+2. **Provision a managed Postgres** (Azure Database for PostgreSQL Flexible Server, Neon, Supabase, or similar). Add `DATABASE_URL` as a Vercel environment variable across **Production, Preview, and Development**. The connection string should include `?sslmode=require`. Ensure the database firewall allows connections from Vercel's serverless runtime (typically by allowing all IPs with SSL required as the mitigation, or by using a provider that supports Vercel IP allowlisting). If you are using a server-side pooler (recommended — see [Section 4.2.1](#421-connection-pooling-serverless)), point `DATABASE_URL` at the pooler port (e.g. `:6432?...&pgbouncer=true` on Azure PG) and add a `DIRECT_URL` env var on port `:5432` so `prisma migrate` can bypass the pooler.
+3. **Set environment variables** in Vercel → Settings → Environment Variables. At minimum:
+   - `NEXTAUTH_URL` — your production URL (e.g., `https://hold.example.com`).
+   - `NEXTAUTH_SECRET`, `SETTINGS_ENCRYPTION_KEY`, `CRON_SECRET`.
+   - `ENABLE_DEV_LOGIN=false`.
+   - `ENABLE_LOCAL_AUTH=false` (unless you truly want local accounts in prod).
+   - `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` (or configure in Settings UI after first admin signs in).
+   - Any optional integration fallbacks from [Section 3](#3-environment-variables-reference).
+4. **Ensure the `ai-proxy/` directory is excluded** from the Next.js build. This is already configured via `tsconfig.json` `exclude` — no action required, but verify after the first deploy that the build does not attempt to compile Azure Functions code.
+
+### 6.2 Deploying
+
+```bash
+vercel --prod --yes
+```
+
+Or push to the configured production branch. The build runs `prisma generate && next build` (via `package.json` `build` script).
+
+### 6.3 Post-deploy
+
+1. **Run migrations** against the production database (only needed if migrations are not part of your build pipeline):
+   ```bash
+   DATABASE_URL="<vercel-postgres-url>" npx prisma migrate deploy
+   ```
+2. **Sign in** via Google → you are promoted to `ADMIN`.
+3. **Configure integrations** in the Settings UI (preferred over env vars).
+4. **Verify the cron** is firing — see [Section 9](#9-background-cron-setup).
+
+### 6.4 Custom domain
+
+Vercel → Project → Domains → add your domain. Update `NEXTAUTH_URL` to match. Update the **Authorized Redirect URI** in Google Cloud Console and any Entra app registration to `https://<your-domain>/api/auth/callback/google` and `/api/auth/callback/azure-ad`.
+
+---
+
+## 7. API Proxy Deployment (Azure Functions)
+
+The `ai-proxy/` directory is a standalone Azure Functions app that transparently proxies Claude, OpenAI, Azure OpenAI, Gemini and Amazon Bedrock traffic and logs usage to the same Postgres database. Deploying it is **optional** — Vercel has fallback proxy routes at `/api/proxy/*` — but Azure Functions is recommended for long-running streams because it supports a 10-minute function timeout versus Vercel's shorter timeouts.
+
+### 7.1 Prerequisites
+
+- Azure subscription + resource group + a Function App (Node 20 runtime).
+- Azure CLI (`az login`).
+- Azure Functions Core Tools v4 (`npm i -g azure-functions-core-tools@4 --unsafe-perm true`).
+
+### 7.2 Install the proxy project
+
+```bash
+cd ai-proxy
+npm install
+```
+
+### 7.3 Configure proxy env
+
+Edit `ai-proxy/local.settings.json` for local runs, or set in Azure Function App → Configuration for production:
+
+| Variable | Purpose |
+|----------|---------|
+| `DATABASE_URL` | **Same** Postgres the main app uses. The proxy writes to `APIUsageLog` / `UsageBucket`. |
+| `PROXY_SECRET` | Shared secret — must match `PROXY_SECRET` in the main app. |
+| `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` | Provider credentials the proxy uses when clients route through it. |
+| `AZURE_OPENAI_ENDPOINT` | Optional. Azure OpenAI resource endpoint (`https://<resource>.openai.azure.com`) the `/api/proxy/azure-openai` route forwards to. The `azure_openai_endpoint` setting (Settings → Proxy Setup) takes precedence; clients can also send `x-azure-openai-resource`. |
+| `AZURE_OPENAI_DEPLOYMENTS` | Optional. JSON deployment → model map (`{"gpt4o-prod":"gpt-4o"}`) so Azure traffic prices correctly. The `azure_openai_deployments` setting takes precedence. |
+| `BEDROCK_REGION` (or `AWS_REGION`) | Optional default region for `/api/proxy/bedrock` when the client sends neither `x-aws-region` nor a SigV4 signature. |
+| `NETWORK_PROXY_MODE` | Optional. `off` (default), `monitor` or `enforce` for the general network proxy at `/api/proxy/net/{host}/{path}`. The `network_proxy_mode` setting takes precedence; the proxy re-reads it every minute. |
+| `PROMPT_HASH_SALT` | Optional. Salt for the prompt correlation hash written to `APIUsageLog.promptMetadata.promptHash`. The proxy first reads the `prompt_hash_salt` setting from the shared database, then this variable, then `NEXTAUTH_SECRET`; the value must be the one the main app uses or hashes will not line up. Unset everywhere → `promptHash` is `null`. |
+
+Model prices live in `ai-proxy/src/lib/pricing.ts`, a byte-for-byte mirror of the app's `src/lib/model-pricing.ts` (Anthropic, OpenAI and Gemini tables; Azure OpenAI prices through the OpenAI table via the deployment map, Bedrock through the Anthropic table after model-id normalisation). When you add a model, edit both and redeploy the proxy — `npm run check:mirror-drift` fails CI if the copies differ. A model missing from the table is logged with cost `0` and `pricingMatched: false` rather than a guessed price.
+
+When proxying traffic, Hold can also generate dangerous-prompt alerts from prompt-risk patterns. The proxy stores redacted excerpts and category signals rather than full prompt bodies by default. Every proxied request also records a salted `promptHash` of the user-authored prompt so the same prompt can be correlated with alerts and Claude Code / Cursor telemetry without storing the prompt itself.
+
+### 7.4 Run locally
+
+```bash
+cd ai-proxy
+npm start          # runs `npm run build` then `func start`
+```
+
+The proxy listens on `http://localhost:7071` by default.
+
+### 7.5 Deploy to Azure
+
+```bash
+cd ai-proxy
+func azure functionapp publish <your-function-app-name> --build remote
+```
+
+`--build remote` lets Azure run `tsc` and `prisma generate` on the cloud builder (avoids local Node/arch mismatches).
+
+### 7.6 Wire clients to the proxy
+
+Direct SDK calls point at the proxy instead of the provider. Every route is path-based — the SDK appends its own paths — so set the base URL / endpoint and keep everything else as-is. The same paths exist on the Vercel fallback under `<platform-url>/api/proxy/...`:
+
+| Provider | SDK base URL / endpoint | Credential header (forwarded verbatim) | Logged with tokens |
+|----------|-------------------------|----------------------------------------|--------------------|
+| Claude | `https://<function-app>.azurewebsites.net/api/proxy/anthropic` | `x-api-key` | `/v1/messages` (count_tokens and batches pass through untouched) |
+| OpenAI | `https://<function-app>.azurewebsites.net/api/proxy/openai/v1` | `Authorization: Bearer` | `/v1/chat/completions`, `/v1/completions`, `/v1/responses`, `/v1/embeddings`; every other `/v1/*` path passes through as a 0-token row with the endpoint in metadata |
+| Azure OpenAI | `https://<function-app>.azurewebsites.net/api/proxy/azure-openai` | `api-key` (or Entra `Authorization: Bearer`) | `/openai/deployments/<deployment>/{chat/completions,completions,embeddings}` and `/openai/v1/responses`; deployment names price through `azure_openai_deployments` |
+| Gemini | `https://<function-app>.azurewebsites.net/api/proxy/gemini` | `x-goog-api-key` (or `?key=`) | `models/<model>:generateContent` and `:streamGenerateContent` (`?alt=sse` or JSON array); `countTokens`, `embedContent` pass through |
+| Bedrock | `https://<function-app>.azurewebsites.net/api/proxy/bedrock` | `Authorization: Bearer <Bedrock API key>` or SigV4, plus `x-aws-region` | `/model/<modelId>/invoke` and `/invoke-with-response-stream` (Anthropic Messages API); `converse` passes through |
+| Any HTTPS host | `https://<function-app>.azurewebsites.net/api/proxy/net/<host>` | Whatever the upstream expects — every header except hop-by-hop and the proxy's own is forwarded | Nothing is parsed or priced; one `NetworkRequestLog` row per request (host, path, verdict, status, bytes). Off until `network_proxy_mode` is set |
+
+Clients authenticate to the proxy with an `x-proxy-key: $PROXY_SECRET` header. The proxy forwards a strict allow-list of headers per provider (`Content-Type`, the provider's credential header, `anthropic-version` / `anthropic-beta`, `OpenAI-Organization` / `OpenAI-Project` / `OpenAI-Beta`, `x-goog-api-client`). Other headers are dropped.
+
+**General network proxy.** `/api/proxy/net/{host}/{path}` forwards any request to `https://{host}/{path}` after checking it against the URL block rules in Settings → Proxy Setup → Network Proxy and the Shadow AI denylist (every discovery marked Blocked). It is **off by default** — an authenticated open forwarder widens what `PROXY_SECRET` can do, so an admin turns it on deliberately, first in `monitor` mode (matches are logged, traffic still flows) and then `enforce` (matches get 403). Only `https` upstreams on public hosts are proxied: loopback, link-local (cloud metadata), RFC 1918 and other non-public ranges are refused by name and again after DNS resolution; redirects are not followed but rewritten back through the proxy so the next hop is evaluated too. Request bodies are capped at 50 MB and buffered; responses stream. Both proxies re-read the rules every 30 s. One platform quirk: the Vercel fallback normalizes URLs the way Next.js does — a trailing slash is redirected away (`308`) and `..` segments are resolved before the proxy sees them — so prefer the Azure route for upstreams that distinguish `/path/` from `/path`.
+
+**Bedrock is log-only in v1.** The proxy never holds AWS credentials or injects them. With a Bedrock API key (`AWS_BEARER_TOKEN_BEDROCK` in the AWS SDKs) the request needs no signing and is forwarded verbatim. SigV4-signed requests are forwarded byte-for-byte with every header the client signed, so the signature must be computed for `bedrock-runtime.<region>.amazonaws.com` — not the proxy host — and the proxy's own headers (`x-proxy-key`, attribution) must be added after signing so they stay unsigned. Signing with a proxy-held IAM role is a separate decision. The region is taken from `x-aws-region`, else the SigV4 credential scope, else `BEDROCK_REGION`.
+
+**Azure OpenAI** needs the resource endpoint and the deployment → model map configured in Settings → Proxy Setup (or the env vars in 7.3) before requests are accepted. The Azure Functions proxy re-reads these settings every minute.
+
+**Redeploy after upgrading.** The route shapes changed in the proxy-coverage release (`proxy/openai/{*path}` replaced the single chat-completions route; `azure-openai`, `gemini` and `bedrock` are new). Run `func azure functionapp publish nammu-ai-proxy --build remote` and re-point OpenAI clients at `/api/proxy/openai/v1`.
+
+**Usage attribution.** The proxy accepts optional headers for tracking:
+
+- `x-user-email` — links usage to a platform user for per-person cost tracking.
+- `x-department` — department or cost center label.
+- `x-ai-system-id` — links usage to a registered AI system in the registry.
+- `x-agent-id` — links usage to a registered AI agent and enables MCP tool governance (server/tool allowlists), charter scope enforcement (access level, connected systems) and human-review triggers, all enforced at the proxy. The same headers authenticate `POST /api/agent-policy/check` for tools the agent executes itself.
+
+For **Claude Code**, the Proxy Setup page in Settings generates ready-to-paste managed settings and per-user `~/.claude/settings.json` snippets. These reference `${PROXY_USER_EMAIL}` for automatic per-user attribution. Each developer adds one line to their shell profile (`~/.zshrc` or `~/.bashrc`):
+
+```bash
+export PROXY_USER_EMAIL="$(git config user.email)"
+```
+
+Without this variable, proxy usage will still be logged but will appear as "Unattributed" on the Oversight dashboards.
+
+**MCP passthrough.** When the request involves Model Context Protocol — detected by any of:
+
+- `mcp_servers` in the JSON body (non-empty array)
+- `anthropic-beta` containing `mcp-client*`
+- any `mcp-*` request header
+
+the Anthropic proxy additionally forwards every `mcp-*` header and the client's `Authorization` header verbatim, so remote MCP servers receive the credentials they need. The proxy still uses the org-level Anthropic key on `x-api-key` regardless. MCP passthrough is logged on the usage record's metadata so admins can see which calls used MCP and which headers were forwarded.
+
+If you want dangerous-prompt monitoring, make sure the relevant OpenAI or Anthropic traffic is routed through this proxy or the app's built-in `/api/proxy/*` routes.
+
+**Usage accounting.** Both the Azure functions and the Vercel fallback routes record the same four token buckets: `inputTokens` / `promptTokens` is all input (uncached + cache read + cache creation) and `cacheReadTokens` / `cacheCreationTokens` are the breakdown; cost is uncached × input + cache read × cache-read + cache creation × cache-write + output × output price. OpenAI streaming calls are accounted too — the proxy adds `stream_options.include_usage` when the client did not, reads the trailing usage chunk, and strips it before it reaches the client — and response DLP runs on streamed output. Anthropic `/v1/messages/count_tokens` and `/v1/messages/batches` pass through without usage rows. Every row stores the provider `requestId` and the attributed `aiSystemId` so session traces can join on them.
+
+---
+
+## 8. Integration Setup
+
+Every integration can be configured **either** via env vars **or** (preferred) via the Settings UI after the first admin signs in. Settings UI values are stored encrypted with `SETTINGS_ENCRYPTION_KEY`.
+
+### 8.1 Google OAuth (sign-in)
+
+1. [Google Cloud Console](https://console.cloud.google.com/) → APIs & Services → Credentials.
+2. Create an **OAuth 2.0 Client ID** (Web application).
+3. **Authorized redirect URI**: `https://<your-domain>/api/auth/callback/google` (and the localhost equivalent for dev).
+4. Copy client ID and secret into `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`, **or** paste them into **Settings → Users & Identity** after your first admin is signed in.
+5. Click **Test Google Auth** in the Settings page.
+
+### 8.2 Microsoft Entra ID (sign-in)
+
+1. Azure Portal → Entra ID → App registrations → New registration.
+2. **Redirect URI** (Web): `https://<your-domain>/api/auth/callback/azure-ad`.
+3. Generate a client secret under **Certificates & secrets**.
+4. API permissions → add `openid`, `profile`, `email`, `User.Read` → grant admin consent.
+5. Put tenant ID, client ID, secret into env vars or **Settings → Users & Identity**.
+
+### 8.3 Google Workspace (shadow-AI discovery)
+
+This is a **separate Google Cloud project/app** from sign-in — do not reuse OAuth credentials.
+
+1. Google Cloud Console → IAM & Admin → Service Accounts → create a service account.
+2. Create and download a JSON key for it.
+3. Enable **domain-wide delegation** on the service account.
+4. Google Workspace admin console → Security → API controls → Domain-wide delegation → add the service account client ID with these scopes (one comma-separated grant):
+   - `https://www.googleapis.com/auth/admin.reports.audit.readonly` — shadow-AI token audit scan
+   - `https://www.googleapis.com/auth/admin.directory.user.security` — revoke an app's OAuth grants when a tool is blocked
+   - `https://www.googleapis.com/auth/admin.directory.user.readonly` — **directory sync** (`GET /admin/directory/v1/users`). The shadow-AI scan does not request this scope, so an existing grant that predates directory sync must be edited to add it or the sync fails with `unauthorized_client`.
+5. **Settings → Shadow AI → Google Workspace**:
+   - Paste the full service-account JSON.
+   - Enter a **super-admin email** for impersonation.
+   - Enable auto-scan; set interval (default 24 h) and lookback (default 30 days).
+6. Click **Test Connection** → **Run Scan Now**.
+7. Optional — **Settings → Users & Identity → Directory sync → Google Workspace directory**: enable auto-sync (default off, 24 h) and click **Sync now** once to populate `DirectoryPerson`. This powers alias folding and department enrichment on Usage by Person, department rollups on Shadow AI, automatic suspension of Hold users whose Google account is suspended or archived, and the `usage_after_deactivation` alert.
+
+### 8.4 Microsoft 365 (shadow-AI discovery)
+
+1. Azure Portal → Entra ID → App registrations → New registration.
+2. **API permissions** → Microsoft Graph → **Application permissions**:
+   - `AuditLog.Read.All`
+   - `Directory.Read.All`
+   - `Application.Read.All`
+   - `User.Read.All` — resolves the principals who granted each app to email addresses (Graph `/users/{id}`). Without it the scan still finds tools but their user emails stay empty. The same permission is what **directory sync** uses to list `/users` (with `$expand=manager`), so it is required, not optional, if you enable that.
+3. **Grant admin consent** for the tenant.
+4. **Certificates & secrets** → create a client secret.
+5. **Settings → Shadow AI → Microsoft 365**: paste tenant ID, client ID, secret; enable auto-scan; set interval.
+6. **Test Connection** → **Run Scan Now**.
+7. Optional — **Settings → Users & Identity → Directory sync → Microsoft Entra ID directory**: enable auto-sync (default off, 24 h), choose whether to include guest accounts (`#EXT#` UPNs are skipped by default), and click **Sync now**. Disabled accounts (`accountEnabled: false`) are stored as deactivated, which suspends the matching Hold user and arms the `usage_after_deactivation` alert.
+
+### 8.4a Microsoft 365 Copilot / Copilot Studio agents (agent discovery)
+
+Imports the agents in the tenant's Microsoft 365 Copilot agent catalog — Copilot Studio agents, Agent Builder agents, and partner or shared agents — into **Agents → Discovered**. Reuses the §8.4 app registration.
+
+1. The tenant needs a **Microsoft Agent 365** license; the API returns `403` without one.
+2. App registration → **API permissions** → Microsoft Graph → **Application permissions** → add **`CopilotPackages.Read.All`**, then **Grant admin consent** (a Global Administrator or Privileged Role Administrator). The permission is read-only.
+3. **Settings → Shadow AI → Agent Platforms**: set **Import Copilot agents** to Enabled, **Save**, then **Test Permission**. A `403` there names the missing permission or license.
+4. Enable **Auto-import** on the same card (or use **Import Now**).
+
+Endpoint: `GET https://graph.microsoft.com/v1.0/copilot/admin/catalog/packages?$filter=supportedHosts/any(h:h eq 'Copilot')` ([Microsoft Learn](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/api/admin-settings/package/copilotpackages-list)). Microsoft-built packages (`type: microsoft`) are skipped. Only catalog metadata is read (name, description, publisher, type, platform, availability/deployment scope, blocked flag) — never agent instructions or knowledge.
+
+### 8.4b Anthropic Managed Agents (agent discovery)
+
+1. In the [Claude Console](https://platform.claude.com/), open the workspace that holds your Managed Agents → **API keys** → create a key. It must be a regular API key; the Admin API key from §8.5 is rejected by the Managed Agents endpoints.
+2. **Settings → Shadow AI → Agent Platforms**: paste it as **Workspace API Key**, **Save**, **Test Connection**.
+3. Enable **Auto-import** (or **Import Now**).
+
+Endpoint: `GET https://api.anthropic.com/v1/agents` with `anthropic-beta: managed-agents-2026-04-01`. One key sees one workspace; archived agents are skipped. Hold reads the agent's name, description, model, tool types, custom tool names and MCP server names/hosts — never its system prompt.
+
+### 8.4c Salesforce Agentforce (agent discovery)
+
+1. In Salesforce Setup, create a **connected app** (or external client app) with OAuth enabled and the `api` scope.
+2. Under OAuth settings, select **Enable Client Credentials Flow**, and in the app's policies set the **Run As** user — ideally an integration-only user with read access to Agentforce / Bot setup (`BotDefinition`, `BotVersion`).
+3. Copy the **consumer key** and **consumer secret**.
+4. **Settings → Shadow AI → Agent Platforms**: enter the org's **My Domain URL** (`https://<domain>.my.salesforce.com`; sandboxes `https://<domain>--<sbx>.sandbox.my.salesforce.com`), the consumer key and secret; **Save**; **Test Connection**.
+5. Enable **Auto-import** (or **Import Now**).
+
+Token: `POST https://<MyDomain>/services/oauth2/token` with `grant_type=client_credentials` ([Salesforce Help](https://help.salesforce.com/s/articleView?id=xcloud.remoteaccess_oauth_client_credentials_flow.htm&type=5)). Inventory: SOQL over REST (`/services/data/v62.0/query`) on `BotDefinition` — the object behind every Agentforce agent — plus `BotVersion` for active/inactive status.
+
+### 8.5 Anthropic Admin API (telemetry)
+
+1. [Anthropic Console](https://console.anthropic.com/) → Organization → Admin Keys → create one.
+2. **Settings → Provider Admin APIs → Anthropic**: paste the admin key; enable sync; set interval (default 6 h).
+3. Click **Test Connection**.
+
+### 8.6 OpenAI Admin API (telemetry)
+
+1. [OpenAI Platform](https://platform.openai.com/) → your org → Admin Keys → create one.
+2. **Settings → Provider Admin APIs → OpenAI**: paste the admin key; enable sync; set interval.
+3. **Test Connection**.
+
+After each successful scheduled OpenAI sync, Hold lists the key's Assistants into **Agents → Discovered** (source `openai_assistants`). Assistants that an older release had written straight into the Agent Registry are linked to their registry row, not duplicated. OpenAI shut the Assistants API down on 2026-08-26, so on current accounts this import normally finds nothing; OpenAI's newer saved agents (Agents API beta) have no list endpoint yet and are not imported.
+
+### 8.6a Cursor Admin API (telemetry)
+
+1. In the Cursor dashboard, create a **team admin** API key — user-level keys return `401`.
+2. Paste it into **Settings → Provider Admin APIs → Cursor** and enable sync.
+
+Supplies per-user, per-day tokens, requests, accepted lines, and charged spend to the Cursor dashboard and Usage by Person.
+### 8.6b ChatGPT Enterprise Compliance API (telemetry + audit)
+
+Requires a ChatGPT Enterprise or Edu workspace.
+
+1. As a **workspace owner**, open the [OpenAI Admin Console](https://admin.openai.com/credentials?tab=admin-keys) → Credentials → Admin keys → **Create new admin key**, scoped to the workspace, with **Custom** permissions: read on **Users**, **GPTs**, and **Compliance logging platform** (add **Conversation messages** only if you want per-user message counts; Hold stores counts, never content). Copy the secret — it is shown once.
+2. Note the **workspace id** (UUID) from the Admin Console URL.
+3. **Integrations → ChatGPT Enterprise Compliance API**: paste the key and workspace id, **Save**, **Test**.
+4. Apply the migration `20260916170000_chatgpt_enterprise_compliance` (`ProviderSyncWatermark`, `ComplianceActivity`) before the first sync — see §10.1.
+
+The hourly `/api/cron/provider-sync/chatgpt_enterprise` job then pulls users, auth/audit events, per-user daily ChatGPT message counts, and Codex activity, and raises alerts for admin-role grants and new GPTs with custom actions. Every workspace GPT is also added to **Agents → Discovered** (source `chatgpt_gpts`, with its owner, tool types and custom-action domains); the first sync imports the existing GPTs without raising an alert per GPT. Streams the key is not scoped for are skipped and listed in the sync-run metadata. Reference: [OpenAI Admin API](https://chatgpt.com/public/admin/api-reference).
+
+### 8.6c GitHub Copilot usage metrics (telemetry)
+
+1. In GitHub, enable the **Copilot usage metrics** policy for the organization (enterprise: *Enabled everywhere*). Report endpoints answer `403` until it is on.
+2. As an org owner, create a token — classic PAT with `read:org` (organization) or `manage_billing:copilot` / `read:enterprise` (enterprise); fine-grained tokens need *View Organization Copilot Metrics* plus Copilot billing read.
+3. Enter the organization login and/or enterprise slug and the token in **Settings → Provider Admin APIs → GitHub Copilot**, click **Test**, and enable sync (env fallbacks: `GITHUB_COPILOT_TOKEN`, `GITHUB_COPILOT_ORG`, `GITHUB_COPILOT_ENTERPRISE`).
+
+Supplies per-developer daily interactions, accepted lines, CLI / app tokens, and feature / IDE / model breakdowns, organization DAU / WAU / MAU and pull-request metrics, and seat assignments (idle-seat list) to the GitHub Copilot dashboard and Usage by Person. Reports land within two days; the sync walks at most 28 days per run, so use Backfill for older history (kept one year upstream). No migration beyond the shared `ProviderSyncWatermark` table.
+### 8.7 Google Gemini / Vertex AI oversight
+
+Hold supports Gemini oversight through Google Cloud Billing export data in BigQuery.
+
+1. In Google Cloud Billing, enable **Billing export to BigQuery** for the billing account that covers your Gemini / Vertex AI usage.
+2. Confirm the export lands in a dataset and table that your Hold service account can read.
+3. Create or reuse a Google service account with BigQuery read access to that dataset and table.
+4. **Settings → Provider Admin APIs → Google Gemini / Vertex AI**:
+   - paste the service-account JSON
+   - enter the billing export project ID
+   - enter the dataset and table names
+   - set the BigQuery location
+5. Click **Test Connection**.
+
+This integration currently provides normalized spend oversight and best-effort attribution from billing export data rather than a direct Gemini admin usage API.
+
+### 8.8 DNS / Proxy log ingestion
+
+No setup beyond the main app; ingest at any time via:
+
+- **Shadow AI → Import CSV** — upload a native DNS / web-proxy export and pick its vendor preset (Cisco Umbrella, Cloudflare Gateway, Zscaler, Netskope, Prisma Access, DNSFilter, NextDNS, or generic). The importer maps that vendor's domain, user, department, count, and timestamp columns; timestamps (ISO or epoch) set each tool's first/last seen.
+- `POST /api/discovered-tools/ingest` with a JSON body (format in the [User Guide §9](./user-guide.md#9-shadow-ai-discovery)).
+
+### 8.9 AI provider for in-app features
+
+Separate from the admin telemetry keys above, Hold uses a provider to power AI risk suggestion, compliance gap analysis, agent review, and summarization. Set once in **Settings → General**:
+
+- Provider: `anthropic` or `openai`
+- Model: e.g., `claude-3.5-sonnet`, `gpt-4`
+- API key (falls back to `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` env var)
+
+### 8.10 Hexnode UEM (shadow-AI discovery)
+
+Catches desktop and mobile apps that never touch an OAuth flow, by reading the app inventory from managed devices.
+
+1. In Hexnode, generate an API key (**Admin → API Access**).
+2. Note your tenant subdomain — the `<subdomain>` in `https://<subdomain>.hexnodemdm.com`.
+3. Enter both in **Settings → Shadow AI**, enable the scan, and set an interval.
+
+### 8.11 CrowdStrike Falcon (shadow-AI discovery)
+
+Discovers AI tools observed running on Falcon-protected endpoints.
+
+1. In the Falcon console, create an API client with read scope for application/asset data.
+2. Note the API base URL for your Falcon cloud region — it differs per region, and the wrong one authenticates but returns nothing.
+3. Enter the client ID, secret, and base URL in **Settings → Shadow AI**, then enable the scan.
+
+### 8.12 Netskope (proxy log ingestion)
+
+A dedicated import path for Netskope's cloud log shipper, separate from generic CSV import.
+
+- Configure in **Settings → Shadow AI → Netskope**.
+- Or post directly to `POST /api/discovered-tools/ingest/netskope`.
+
+Hostnames are normalized before matching, so casing and trailing-dot variants will not create duplicate tools. The event `timestamp` (epoch seconds, or ISO) is read for each tool's first/last seen.
+
+### 8.13 AI gateways (telemetry without re-routing)
+
+If your traffic already flows through a gateway, Hold can read its records instead of sitting in the request path. Supported: **OpenRouter**, **Helicone**, **Portkey**, **LiteLLM**.
+
+Add credentials per gateway in **Settings → Integrations** (or via the env vars in §3.11), then confirm the tile reads as connected on the **Integrations** page. Gateways run on the global `provider_sync_enabled` / `provider_sync_interval_hours` (Settings → Provider Admin APIs); there are no per-gateway schedules yet.
+
+### 8.14 Shadow-AI block enforcement
+
+Blocking a tool in Hold records a decision; it does not stop traffic on its own. Wire up at least one enforcement layer:
+
+**Network** — generate a feed token in **Settings → Shadow AI**, then point a DNS sinkhole, proxy ACL, firewall URL list, or CASB at:
+
+```bash
+curl -H "Authorization: Bearer $SHADOW_AI_BLOCKLIST_TOKEN" \
+  "https://<your-domain>/api/discovered-tools/blocklist?format=hosts"
+```
+
+Formats: `text` (default), `hosts`, `json`, `pac`. Responses are cacheable for 60s and must revalidate, so an unblock propagates within about a minute.
+
+**Identity** — connect Google Workspace and/or Microsoft 365 so a block can disable the app at the IdP. Microsoft additionally requires admin consent for the app-management Graph permission; without it, enforcement reports `failed` rather than silently doing nothing.
+
+**Settings → Shadow AI** shows a readiness summary for both layers. With neither configured, a block is an auditable decision and nothing more.
+
+### 8.15 Developer-AI telemetry (Claude Code, Cowork, Cursor)
+
+These dashboards are fed by an OpenTelemetry pipeline posting to Hold, not by provider admin APIs.
+
+1. Set `CLAUDE_CODE_TELEMETRY_SECRET` and/or `CURSOR_TELEMETRY_SECRET`.
+2. Configure your OTel collector to forward to `POST /api/telemetry/claude-code` or `POST /api/telemetry/cursor` with that secret as a Bearer token.
+3. Set `CLAUDE_CODE_TELEMETRY_RETENTION_DAYS` / `CURSOR_TELEMETRY_RETENTION_DAYS` (or the Data Retention card in Settings → General) and make sure the prune crons from §9.2 are scheduled.
+
+All of this is metadata only — no prompt text and no code content is transmitted or stored. Note that the Cursor OTel hook carries no token or cost data; Cursor tokens and spend come from the Cursor Admin API sync (§8.6a), without which the Cursor dashboard shows activity metrics only.
+
+Ingest is idempotent. Each row is stored with a content-hash `dedupeKey`, so a collector that retries a timed-out batch (the shipped config uses `retry_on_failure` + `sending_queue`) does not double-write; the `202` response reports `accepted` (rows inserted) and `duplicates` (rows skipped). Bodies that flatten to more than 5000 rows are rejected with `413` — raise `TELEMETRY_MAX_ROWS` only if you have deliberately increased the collector's batch size (default flush is 1000).
+
+### 8.15a Endpoint agent (shadow-AI discovery from managed machines)
+
+A signed binary pushed by MDM to macOS and Windows that reports which AI tools a machine actually runs and reaches. It is the only source that sees a laptop off the VPN, a personal-tier account, a desktop app with no SaaS audit trail, or a model served from loopback. Source lives in `ops/endpoint-agent/`.
+
+1. **Generate the enrollment secret** in Settings → Endpoint Agent (stored encrypted; `ENDPOINT_AGENT_ENROLLMENT_SECRET` is the env fallback).
+2. **Build and sign.** `cd ops/endpoint-agent && make` produces a macOS universal binary and a Windows amd64 exe. Both **must** be signed — Gatekeeper blocks unsigned Mac binaries and SmartScreen flags unsigned Windows ones, and both deploy scripts refuse to install one.
+   ```bash
+   make notarize-darwin DEVELOPER_ID="Developer ID Application: … (TEAMID)" NOTARY_PROFILE=<profile>
+   ```
+   Windows needs an Authenticode signature from your own code-signing certificate.
+3. **Host the binaries** somewhere the fleet can reach over HTTPS.
+4. **Push the deploy script** for your MDM, with `CONSOLE_URL`, `ENROLLMENT_SECRET` and `BINARY_URL` (https only) set, plus the signer pin — `EXPECTED_TEAM_ID` on macOS, `EXPECTED_THUMBPRINT` on Windows. The scripts refuse a binary that is validly signed but not by that identity. Scripts for three live in `ops/endpoint-agent/mdm/`:
+
+   | MDM | macOS | Windows |
+   |-----|-------|---------|
+   | Iru (formerly Kandji) | `iru-audit-endpoint-agent.sh` + `iru-remediate-endpoint-agent.sh` | `iru-audit-endpoint-agent.ps1` + `iru-remediate-endpoint-agent.ps1` |
+   | Jamf Pro | `jamf-deploy-endpoint-agent.sh` | — (Jamf is Apple-only) |
+   | Hexnode | `hexnode-deploy-endpoint-agent.sh` | `hexnode-deploy-endpoint-agent.ps1` |
+
+   All install a **LaunchAgent** in the console user's session on macOS, or an at-logon **Scheduled Task** in the user's context on Windows, and all refuse an unsigned binary.
+
+   **Iru** uses an audit-and-remediation pair, which is the cheapest option at scale: the audit runs a few local checks, so a 15-minute check-in stays quiet until something is actually wrong rather than re-downloading the binary fleet-wide. Set `CONSOLE_URL` identically in both halves. Bumping `EXPECTED_VERSION` in the audit is how an upgrade rolls out.
+
+   **Jamf Pro** takes its values from policy parameters 4-8 (Jamf reserves `$1`-`$3`): console URL, enrollment secret, binary URL, an optional expected version, and the signing Team ID (parameter 8, required). Set parameter 7 — without it an Ongoing policy re-downloads the agent on every check-in.
+
+   The scripts contain no MDM-specific API calls, so adapting one to Intune, Workspace ONE or Mosyle is mostly a matter of how that console passes parameters. Details for all three are in `ops/endpoint-agent/README.md`.
+
+   Every script installs the agent into the *user's* session, not root/SYSTEM, because browser profiles live in the user's home and Full Disk Access is per-user. A privileged daemon would need far broader access to see less.
+5. **Grant Full Disk Access on macOS** via a PPPC profile for `/usr/local/bin/hold-agent` (`SystemPolicyAllFiles`), or Safari history is skipped and the device reports the browser collector as `partial_no_access`.
+6. **Schedule `/api/cron/endpoint-agent-sweep`** (§9.1) so agents that stop reporting are marked stale rather than silently reading as "no AI activity".
+
+Cadence and which collectors run are console-side settings delivered in the manifest, so changing them applies fleet-wide with no redeploy.
+
+The **MCP servers & agent frameworks** collector (`agents`) needs agent **0.2.0 or later** and no extra permission: MCP client configs and package folders are in the user's own home directory. It is **off by default** (opt-in, because MCP configs are where credentials live): tick it in Settings → Endpoint Agent to turn it on fleet-wide. Deploy the server change before the new agent. Agents older than 0.2.0 never send the new fields, and a newer agent's unrecognized values drop only the affected item, never the report.
+
+Verify a machine before the fleet rollout — this prints the exact bytes that would be transmitted, without sending them:
+
+```bash
+hold-agent --config /path/to/agent.json --dry-run
+```
+
+The agent reports identifiers and counts only: never prompts, responses, URL paths, query strings, page titles, window titles, file paths or command lines. Hostnames are allowlisted server-side against the AI tools registry, so a host that is not a known AI tool never leaves the machine. See `ops/endpoint-agent/README.md`.
+### 8.16 Scheduled report email (Resend)
+
+Required for report schedules to actually deliver.
+
+1. Create a Resend API key and verify your sending domain.
+2. Set `RESEND_API_KEY` and `REPORT_EMAIL_FROM`, or configure them in **Settings → Reporting**.
+3. Ensure `/api/cron/run-report-schedules` is scheduled (§9.2).
+
+Without this, schedules save successfully and silently never send.
+
+### 8.17 Azure Monitor (Proxy Health metrics)
+
+Optional. Adds function-app platform metrics — invocations, error rate, response time — to the Proxy Health board, which otherwise only knows what the proxy managed to write to the database.
+
+Configure the subscription ID, resource group, and function app name in **Settings**. This integration has **no env-var fallback**; the Settings UI is the only place to set it.
+
+Once configured, `/api/cron/proxy-health` (§9.2) pulls a snapshot every 15 minutes; the board's **Sync now** button runs the same sync on demand. Until it is configured the cron returns a skip response and writes nothing.
+
+### 8.18 Datadog
+
+Optional observability export. Set `DATADOG_API_KEY`, `DATADOG_APP_KEY`, `DATADOG_SITE`, and `DATADOG_ENABLED`, or configure them in Settings.
+
+---
+
+## 9. Background Cron Setup
+
+Hold schedules **one cron entry per background job**. Every route authenticates with `Authorization: Bearer $CRON_SECRET`, and every hourly route checks its own saved enable flag and interval before doing work, so the hourly tick is cheap when nothing is due.
+
+### 9.1 Hourly routes (one function per unit of work)
+
+| Endpoint | Entries | Purpose |
+|----------|---------|---------|
+| `/api/cron/provider-sync/<provider>` | 13 (`anthropic`, `claude_code`, `cursor`, `github_copilot`, `gemini`, `openai`, `openrouter`, `helicone`, `portkey`, `litellm`, `chatgpt_enterprise`, `anthropic_compliance`, `claude_enterprise`) | Pulls that provider's admin telemetry when its own interval has elapsed since its last successful sync. |
+| `/api/cron/discovery-scan/<source>` | 5 (`google_workspace`, `microsoft_365`, `hexnode`, `crowdstrike`, `agent_platforms`) | Runs that shadow-AI scan on its configured interval; fails stuck scans of the same source first. `agent_platforms` imports agents from Anthropic Managed Agents, Microsoft Copilot and Salesforce Agentforce (§8.4a–c) into **Agents → Discovered**. |
+| `/api/cron/governance-automation` | 1 | Review-renewal, exception-renewal, and ownership-escalation alerts. |
+| `/api/cron/key-usage-rules` | 1 | Key usage rule evaluation. |
+| `/api/cron/agent-discovery` | 1 | Proxy agent detection: queues agent-like callers without `x-agent-id` under Agents → Discovered. |
+| `/api/cron/endpoint-agent-sweep` | 1 | Marks endpoint agents that have stopped reporting as `STALE`, so a fleet of dead agents reads as "no data" rather than "no AI activity". |
+
+Running each provider and each scan source in its own function means a slow or failing one cannot delay the others, and each provider's schedule is tracked from its own last success.
+
+### 9.2 Dedicated crons
+
+| Endpoint | Schedule | Purpose |
+|----------|----------|---------|
+| `/api/cron/run-report-schedules` | every 15 min | Sends due scheduled reports. |
+| `/api/cron/proxy-health` | every 15 min | Pulls an Azure Monitor window into `ProxyHealthSnapshot` for the Proxy Health board. Skips when Azure Monitor is unconfigured. |
+| `/api/cron/sensitive-scan` | daily | Probes configured gateways for data leakage. |
+| `/api/cron/provider-security-scan` | daily | Audits provider secure-use and privacy configuration. |
+| `/api/cron/prune-claude-code-metrics` | daily | Enforces Claude Code telemetry retention. |
+| `/api/cron/prune-cursor-metrics` | daily | Enforces Cursor telemetry retention. |
+| `/api/cron/prune-collection` | daily | Enforces retention for the proxy request log, the network proxy request log, agent tool calls, policy denials, provider raw snapshots, proxy health snapshots, compliance activity, and scan runs (see §3.12). |
+
+The prune jobs matter more than they look: the developer-AI telemetry tables and the proxy request log are high-volume, and without retention they grow without bound. `prune-collection` deletes oldest-first in batches of 5,000 inside a fixed time budget and reports `deleted` / `remaining` per table, so a large backlog drains over several nights rather than timing out.
+
+### 9.3 Vercel Cron (recommended if deploying to Vercel)
+
+All of the above are already configured in `vercel.json` (30 entries, staggered so the hourly jobs do not all fire at minute zero):
+
+```json
+{
+  "crons": [
+    { "path": "/api/cron/provider-sync/anthropic", "schedule": "0 * * * *" },
+    { "path": "/api/cron/provider-sync/claude_code", "schedule": "3 * * * *" },
+    { "path": "/api/cron/provider-sync/cursor", "schedule": "6 * * * *" },
+    { "path": "/api/cron/provider-sync/gemini", "schedule": "9 * * * *" },
+    { "path": "/api/cron/provider-sync/openai", "schedule": "12 * * * *" },
+    { "path": "/api/cron/provider-sync/openrouter", "schedule": "15 * * * *" },
+    { "path": "/api/cron/provider-sync/helicone", "schedule": "18 * * * *" },
+    { "path": "/api/cron/provider-sync/portkey", "schedule": "21 * * * *" },
+    { "path": "/api/cron/provider-sync/litellm", "schedule": "24 * * * *" },
+    { "path": "/api/cron/provider-sync/chatgpt_enterprise", "schedule": "27 * * * *" },
+    { "path": "/api/cron/provider-sync/github_copilot", "schedule": "33 * * * *" },
+    { "path": "/api/cron/provider-sync/anthropic_compliance", "schedule": "36 * * * *" },
+    { "path": "/api/cron/provider-sync/claude_enterprise", "schedule": "57 * * * *" },
+    { "path": "/api/cron/discovery-scan/google_workspace", "schedule": "30 * * * *" },
+    { "path": "/api/cron/discovery-scan/microsoft_365", "schedule": "35 * * * *" },
+    { "path": "/api/cron/discovery-scan/hexnode", "schedule": "40 * * * *" },
+    { "path": "/api/cron/discovery-scan/crowdstrike", "schedule": "45 * * * *" },
+    { "path": "/api/cron/discovery-scan/agent_platforms", "schedule": "42 * * * *" },
+    { "path": "/api/cron/governance-automation", "schedule": "50 * * * *" },
+    { "path": "/api/cron/agent-discovery", "schedule": "52 * * * *" },
+    { "path": "/api/cron/key-usage-rules", "schedule": "55 * * * *" },
+    { "path": "/api/cron/endpoint-agent-sweep", "schedule": "58 * * * *" },
+    { "path": "/api/cron/directory-sync/google_workspace", "schedule": "10 4 * * *" },
+    { "path": "/api/cron/directory-sync/microsoft_365", "schedule": "20 4 * * *" },
+    { "path": "/api/cron/prune-claude-code-metrics", "schedule": "23 3 * * *" },
+    { "path": "/api/cron/prune-cursor-metrics", "schedule": "31 3 * * *" },
+    { "path": "/api/cron/prune-collection", "schedule": "45 3 * * *" },
+    { "path": "/api/cron/run-report-schedules", "schedule": "*/15 * * * *" },
+    { "path": "/api/cron/sensitive-scan", "schedule": "0 6 * * *" },
+    { "path": "/api/cron/provider-security-scan", "schedule": "0 7 * * *" },
+    { "path": "/api/cron/proxy-health", "schedule": "*/15 * * * *" }
+  ]
+}
+```
+
+Per-provider sync cadence is set in **Settings → Provider Admin APIs** (global default plus a per-provider override table); shadow-AI scan and agent platform import cadence in **Settings → Shadow AI**.
+
+> **Hobby-plan limit**: Vercel's Hobby tier caps cron frequency and the total number of crons (well below the 30 entries above). Either upgrade to Pro, or drive the endpoints from an external scheduler as below.
+
+### 9.4 External cron (non-Vercel hosts)
+
+Use any scheduler (GitHub Actions, cron-job.org, Render Cron, an Azure Function timer, etc.) to hit the endpoints on the schedules above. For example, one provider sync:
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" \
+  https://<your-domain>/api/cron/provider-sync/anthropic
+```
+
+Hit every provider you have configured, each discovery source you have enabled, plus `governance-automation`, `agent-discovery` and `key-usage-rules` hourly, then add whichever dedicated crons you need from §9.2. Skipping the prune jobs is the one omission that degrades over time rather than immediately.
+
+> **Migrating from the old endpoint**: `GET /api/scheduler/maintenance` still works for one release as a deprecated shim (it runs every job inside a single 60-second function and returns a `Deprecation: true` header). Move your scheduler to the per-job routes above before the next release.
+
+### 9.5 Manual trigger (useful for testing)
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" \
+  http://localhost:3001/api/cron/provider-sync/cursor
+```
+
+The response reports whether the job was `due`, and if not, the `skippedReason` and `nextDueAt`.
+
+### 9.6 Verifying cron health
+
+- **Settings → Provider Admin APIs** shows each provider's last run, outcome, and next-due time, and the **Sync History & Backfill** card shows each provider's ingested date range (earliest day → watermark). Scheduled syncs are incremental from the watermark; on a fresh install the first run reaches back at most 31 days. Use **Backfill** there to pull older history (7-day chunks, one request each) up to the provider's retention — Cursor keeps ~30 days upstream, so backfill it soon after connecting.
+- **Shadow AI** page shows the most recent `ScanHistory` row.
+- Any failures show up with an error message in the relevant admin page.
+
+---
+
+## 10. Upgrades & Migrations
+
+### 10.1 Pulling a new version
+
+```bash
+git pull
+npm install          # re-runs prisma generate
+npm run db:migrate   # applies any new migrations
+```
+
+Merging or deploying a release does **not** migrate the database — run `npx prisma migrate deploy` against production yourself after each deploy that ships a migration. The data-collection Tier 1 release adds `20260916120000_collection_tier1`, which adds the `userEmails`, `scopes`, `firstSeenAt`, and `lastSeenAt` columns to `DiscoveredAITool` and a unique `dedupeKey` column to `ClaudeCodeMetric`, `ClaudeCodeEvent`, `CursorMetric`, and `CursorSpan`. Until it is applied, Shadow AI scans and OTel ingest will fail on the missing columns. Redeploy the Azure proxy in the same release so its pricing table matches the app's. The ChatGPT Enterprise release adds `20260916170000_chatgpt_enterprise_compliance`, which creates `ProviderSyncWatermark` and `ComplianceActivity`; until it is applied the `chatgpt_enterprise` sync fails on the missing tables (no other provider is affected). The network proxy release (v0.11.0) adds `20261026120000_network_proxy` (`NetworkBlockRule`, `NetworkRequestLog`, the `NetworkRuleAction` enum); until it is applied, Settings → Proxy Setup errors on the missing tables and the Azure proxy's network route fails closed in enforce mode. Redeploy the Azure proxy with it — the `proxy/net/{host}/{*path}` function and the mirrored schema ship together. The probe-response history release adds `20261102130000_sensitive_probe_results` (`SensitiveProbeResult`); until it is applied, **Sensitive Scan** runs fail on the missing table. No proxy redeploy is needed for it.
+
+**If your workstation cannot reach the database.** Some networks let the TCP handshake to Azure Postgres through but drop the Postgres TLS request that follows, so `prisma migrate deploy` fails with `P1001` even though the server is healthy and serving the app. Run the migration from inside Azure instead (Cloud Shell at https://shell.azure.com). If Cloud Shell cannot `git clone` either, package the migration as one SQL file that also records it in Prisma's history, upload it with the Cloud Shell toolbar, and run it with `psql -v ON_ERROR_STOP=1 -f`:
+
+```sql
+BEGIN;
+-- paste prisma/migrations/<name>/migration.sql here
+INSERT INTO "_prisma_migrations" (id, checksum, finished_at, migration_name, logs, rolled_back_at, started_at, applied_steps_count)
+VALUES (gen_random_uuid()::text, '<sha256 of migration.sql>', now(), '<name>', NULL, NULL, now(), 1);
+COMMIT;
+```
+
+The checksum is `shasum -a 256 prisma/migrations/<name>/migration.sql`. Afterwards `npx prisma migrate status` reports the schema up to date, so the next `migrate deploy` does not try to re-apply it.
+
+### 10.2 Major version upgrades
+
+Always read `CHANGELOG.md` (if present) and skim new migrations in `prisma/migrations/` before applying. On production:
+
+1. Take a database snapshot.
+2. Deploy the new version to a **preview** environment first, ideally with a clone of production data.
+3. `npx prisma migrate deploy` against production only after the preview verifies.
+
+### 10.3 Rotating secrets
+
+- **`NEXTAUTH_SECRET`**: rotating invalidates all active sessions; users must sign in again.
+- **`SETTINGS_ENCRYPTION_KEY`**: **do not rotate in place**. If you must, re-save every encrypted `AppSetting` through the UI after changing the key (the old key is required to decrypt; the new key to encrypt). Easier path: export settings, change the key, re-enter via UI.
+- **`CRON_SECRET`**: update wherever the cron caller uses it (Vercel config is in-code, so redeploy; external cron needs its config updated).
+- **`PROXY_SECRET`**: update both the main app env and the Azure Function App config together.
+
+---
+
+## 11. Uninstall / Reset
+
+### 11.1 Wipe local dev
+
+```bash
+# Drop and recreate the database
+npm run db:reset       # uses --force; wipes all data
+
+# Or drop the whole database
+dropdb hold_dev
+createdb hold_dev
+npm run db:migrate
+npm run db:seed
+```
+
+### 11.2 Tear down Vercel
+
+1. Delete the Vercel project (Project → Settings → Delete).
+2. Delete the Vercel Postgres store.
+3. Revoke / delete OAuth credentials in Google Cloud Console and Azure AD.
+4. Revoke admin keys in the Anthropic / OpenAI consoles.
+
+### 11.3 Tear down the Azure proxy
+
+```bash
+az functionapp delete --name <function-app-name> --resource-group <rg>
+```
+
+---
+
+## 12. Troubleshooting
+
+### `npm install` fails at `postinstall` / `prisma generate`
+
+- Ensure you have Node 20+: `node --version`.
+- Ensure `DATABASE_URL` is **not required** at install time (it isn't — Prisma generate does not connect). If you still see errors, delete `node_modules` and `package-lock.json`, then `npm install` again.
+
+### `Error: P1001: Can't reach database server`
+
+- Verify `DATABASE_URL` is correct (`psql "$DATABASE_URL"` should connect).
+- For managed Postgres, ensure `?sslmode=require` is present.
+- Check firewall / VPC rules allow inbound from your host (or Vercel IPs).
+
+### `NEXTAUTH_URL mismatch` after deploying
+
+- Set `NEXTAUTH_URL` to the canonical public URL (no trailing slash).
+- Update the redirect URI in Google / Microsoft app registrations to match.
+
+### "This app is running in dev mode in production"
+
+- `ENABLE_DEV_LOGIN=true` is set in a production deployment. The app fails fast to protect you from accidentally exposing credential login. Set `ENABLE_DEV_LOGIN=false` and redeploy.
+
+### First Google sign-in did not create an admin
+
+- Auto-promotion only fires for **Google OAuth** sign-ins, not dev credentials or Microsoft sign-in.
+- Work around: sign in however you can, then (if you are the only user) manually promote yourself via SQL:
+  ```sql
+  UPDATE "User" SET role = 'ADMIN' WHERE email = 'you@example.com';
+  ```
+
+### "Cannot find module '@prisma/client'"
+
+- Run `npx prisma generate` and restart the dev server.
+
+### Build succeeds locally but fails on Vercel
+
+- Check Vercel's Node version matches (should be 20+). Set in **Project → Settings → General → Node.js Version**.
+- Confirm `ai-proxy/` is excluded from the build (it is via `tsconfig.json` `exclude`).
+
+### Cron never runs on Vercel
+
+- Cron jobs only run on **production deployments**, not preview URLs.
+- Verify `vercel.json` is at the repo root and committed.
+- Hit the endpoint manually with the correct `Authorization` header to verify it works end-to-end.
+
+### Azure proxy deploy fails with TypeScript errors
+
+- Build locally first: `cd ai-proxy && npm run build`. Fix errors, recommit, redeploy.
+- `--build remote` avoids local-arch issues but still requires the code to compile.
+
+### Settings UI won't save secrets
+
+- `SETTINGS_ENCRYPTION_KEY` must be set (≥ 32 bytes of random material) **before** you attempt to save any encrypted setting. Otherwise the save path throws.
+
+---
+
+*Once install is complete, see the [User Guide](./user-guide.md) to start registering AI systems.*

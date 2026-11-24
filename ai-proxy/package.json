@@ -1,0 +1,24 @@
+{
+  "name": "hold-ai-proxy",
+  "version": "1.0.0",
+  "description": "Hold AI API Proxy — Claude, OpenAI, Azure OpenAI, Gemini and Bedrock usage logging + policy enforcement",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "build": "tsc && prisma generate",
+    "start": "npm run build && func start",
+    "prestart": "npm run build",
+    "test": "echo \"No tests yet...\""
+  },
+  "comments": {
+    "devDependencies": "azure-functions-core-tools is NOT listed here because it ships an npm-shrinkwrap.json pinning brace-expansion@2.0.2 (CVE GHSA-f886-m6hf-6m8v). Install it globally (npm i -g azure-functions-core-tools@4) to use 'func start' locally or 'func azure functionapp publish' to deploy."
+  },
+  "dependencies": {
+    "@azure/functions": "^4.16.2",
+    "@prisma/client": "^6.19.3",
+    "prisma": "^6.19.3"
+  },
+  "devDependencies": {
+    "@types/node": "^26",
+    "typescript": "^7.0.2"
+  }
+}

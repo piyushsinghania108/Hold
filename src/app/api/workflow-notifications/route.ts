@@ -1,0 +1,187 @@
+import { NextResponse } from "next/server";
+import type { Prisma } from "@prisma/client";
+import { withAuth } from "@/lib/auth-guard";
+import { prisma } from "@/lib/prisma";
+import { buildWorkflowNotifications } from "@/lib/workflow-notifications";
+
+type InvestigationNotification = {
+  id: string;
+  title: string;
+  updatedAt: Date;
+};
+
+type WorkflowNotificationsClient = {
+  investigation: {
+    findMany: (
+      args: Prisma.InvestigationFindManyArgs
+    ) => Promise<InvestigationNotification[]>;
+  };
+};
+
+export async function GET() {
+  return withAuth(async () => {
+    const prismaClient = prisma as unknown as WorkflowNotificationsClient;
+    const now = new Date();
+    const sevenDaysFromNow = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+
+    const [
+      recentApprovals,
+      expiringExceptions,
+      driftAlerts,
+      openIncidents,
+      overdueReviews,
+      investigations,
+      agentApprovals,
+      agentOverdueReviews,
+      reviewAlerts,
+      pendingReviews,
+    ] = await Promise.all([
+      prisma.systemApproval.findMany({
+        orderBy: { createdAt: "desc" },
+        take: 5,
+        include: { aiSystem: { select: { name: true } } },
+      }),
+      prisma.governanceException.findMany({
+        where: { status: "ACTIVE", expiresAt: { lte: sevenDaysFromNow, gte: now } },
+        orderBy: { expiresAt: "asc" },
+        take: 5,
+        include: { aiSystem: { select: { name: true } } },
+      }),
+      prisma.alert.findMany({
+        where: { source: { in: ["system_drift", "agent_behavior_drift"] }, status: { in: ["OPEN", "ACKNOWLEDGED"] } },
+        orderBy: { createdAt: "desc" },
+        take: 5,
+      }),
+      prisma.governanceIncident.findMany({
+        where: { status: { in: ["OPEN", "ACKNOWLEDGED"] } },
+        orderBy: { openedAt: "desc" },
+        take: 5,
+        include: { aiSystem: { select: { name: true } }, agent: { select: { id: true, name: true } } },
+      }),
+      prisma.aISystem.findMany({
+        where: { nextReviewDate: { lt: now } },
+        orderBy: { nextReviewDate: "asc" },
+        take: 5,
+        select: { id: true, name: true, nextReviewDate: true },
+      }),
+      prismaClient.investigation.findMany({
+        where: { status: { in: ["OPEN", "IN_PROGRESS"] } },
+        orderBy: { updatedAt: "desc" },
+        take: 5,
+      }),
+      prisma.agentApproval.findMany({
+        orderBy: { createdAt: "desc" },
+        take: 5,
+        include: { agent: { select: { id: true, name: true } } },
+      }),
+      prisma.aIAgent.findMany({
+        where: { nextReviewDate: { lt: now }, status: { notIn: ["RETIRED", "DEPRECATED"] } },
+        orderBy: { nextReviewDate: "asc" },
+        take: 5,
+        select: { id: true, name: true, nextReviewDate: true },
+      }),
+      prisma.alert.findMany({
+        where: { source: "human_review_trigger", status: { in: ["OPEN", "ACKNOWLEDGED"] } },
+        orderBy: { createdAt: "desc" },
+        take: 5,
+        select: { id: true, title: true, createdAt: true },
+      }),
+      prisma.humanReviewRequest.findMany({
+        where: { status: "PENDING" },
+        orderBy: { lastSeenAt: "desc" },
+        take: 5,
+        select: { id: true, lastSeenAt: true, calls: true, agent: { select: { name: true } } },
+      }),
+    ]);
+
+    const notifications = buildWorkflowNotifications({
+      recentApprovals: recentApprovals.map((approval: {
+        id: string;
+        decision: string;
+        createdAt: Date;
+        aiSystem: { name: string };
+      }) => ({
+        id: approval.id,
+        systemName: approval.aiSystem.name,
+        decision: approval.decision,
+        createdAt: approval.createdAt,
+      })),
+      expiringExceptions: expiringExceptions.map((exception: {
+        id: string;
+        expiresAt: Date;
+        aiSystem: { name: string };
+      }) => ({
+        id: exception.id,
+        systemName: exception.aiSystem.name,
+        expiresAt: exception.expiresAt,
+      })),
+      driftAlerts: driftAlerts.map((alert: {
+        id: string;
+        title: string;
+        createdAt: Date;
+      }) => ({
+        id: alert.id,
+        title: alert.title,
+        createdAt: alert.createdAt,
+      })),
+      openIncidents: openIncidents.map((incident: {
+        id: string;
+        title: string;
+        openedAt: Date;
+        aiSystem: { name: string } | null;
+        agent: { id: string; name: string } | null;
+      }) => ({
+        id: incident.id,
+        // An agent incident is about the agent even when its parent system is recorded too.
+        systemName: incident.agent
+          ? `${incident.agent.name} (agent)`
+          : incident.aiSystem?.name ?? "Unassigned",
+        title: incident.title,
+        openedAt: incident.openedAt,
+        href: incident.agent ? `/agents/${incident.agent.id}#incidents` : undefined,
+      })),
+      agentApprovals: agentApprovals.map((approval) => ({
+        id: approval.id,
+        agentId: approval.agent.id,
+        agentName: approval.agent.name,
+        decision: approval.decision,
+        createdAt: approval.createdAt,
+      })),
+      agentOverdueReviews: agentOverdueReviews.map((agent) => ({
+        id: agent.id,
+        agentName: agent.name,
+        nextReviewDate: agent.nextReviewDate ?? now,
+      })),
+      reviewAlerts,
+      pendingReviews: pendingReviews.map((r) => ({
+        id: r.id,
+        agentName: r.agent.name,
+        tool:
+          Array.isArray(r.calls) && r.calls[0] && typeof r.calls[0] === "object"
+            ? String((r.calls[0] as { tool?: string }).tool ?? "a tool call")
+            : "a tool call",
+        lastSeenAt: r.lastSeenAt,
+      })),
+      overdueReviews: overdueReviews.map((system: {
+        id: string;
+        name: string;
+        nextReviewDate: Date | null;
+      }) => ({
+        id: system.id,
+        systemName: system.name,
+        nextReviewDate: system.nextReviewDate ?? now,
+      })),
+      investigations: investigations.map((investigation: {
+        id: string;
+        title: string;
+        updatedAt: Date;
+      }) => ({
+        id: investigation.id,
+        title: investigation.title,
+        updatedAt: investigation.updatedAt,
+      })),
+    });
+
+    return NextResponse.json(notifications);
+  });
+}

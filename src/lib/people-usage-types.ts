@@ -1,0 +1,135 @@
+// Prisma-free types and constants for Usage by Person. Kept separate from
+// people-usage.ts (which imports the Prisma client) so client components can
+// import labels and row types without dragging the database client into the
+// browser bundle.
+
+export type PeopleUsageRange = "7d" | "30d" | "90d";
+
+export const PEOPLE_USAGE_RANGES: { value: PeopleUsageRange; label: string; days: number }[] = [
+  { value: "7d", label: "Last 7 days", days: 7 },
+  { value: "30d", label: "Last 30 days", days: 30 },
+  { value: "90d", label: "Last 90 days", days: 90 },
+];
+
+export function parsePeopleUsageRange(raw: string | null | undefined): PeopleUsageRange {
+  return PEOPLE_USAGE_RANGES.some((r) => r.value === raw) ? (raw as PeopleUsageRange) : "30d";
+}
+
+export function resolvePeopleUsageWindow(
+  range: PeopleUsageRange,
+  now: Date = new Date(),
+): { since: Date; until: Date } {
+  const days = PEOPLE_USAGE_RANGES.find((r) => r.value === range)?.days ?? 30;
+  return { since: new Date(now.getTime() - days * 24 * 60 * 60 * 1000), until: now };
+}
+
+export type PersonSurface =
+  | "claude_code"
+  | "cowork"
+  | "claude_enterprise"
+  | "cursor"
+  | "github_copilot"
+  | "proxy";
+
+export const SURFACE_LABELS: Record<PersonSurface, string> = {
+  claude_code: "Claude Code",
+  cowork: "Cowork",
+  claude_enterprise: "Claude Enterprise",
+  cursor: "Cursor",
+  github_copilot: "GitHub Copilot",
+  proxy: "API (proxy)",
+};
+
+export const SURFACE_ORDER: PersonSurface[] = [
+  "claude_code",
+  "cowork",
+  "claude_enterprise",
+  "cursor",
+  "github_copilot",
+  "proxy",
+];
+
+/**
+ * Where the person stands in the synced identity-provider directory:
+ * `active` / `deactivated` when a DirectoryPerson row matches the email (or
+ * one of its aliases), `unknown` when no directory sync covers them.
+ */
+export type PersonDirectoryStatus = "active" | "deactivated" | "unknown";
+
+export interface PersonUsageRow {
+  /** Directory primary email when the observed address was an alias; otherwise the observed email. */
+  email: string;
+  name: string | null;
+  department: string | null;
+  directoryStatus: PersonDirectoryStatus;
+
+  // Claude Code (terminal / IDE). `claudeCodeSource` says where the numbers
+  // came from: live OTel, or the Admin API analytics fallback.
+  claudeCodeSource: "otel" | "admin_api" | null;
+  claudeCodeSessions: number;
+  claudeCodeTokens: number;
+  claudeCodeLinesAdded: number;
+  claudeCodeCommits: number;
+  claudeCodeCost: number;
+
+  // Cowork (Claude Desktop VM, entrypoint local-agent) — OTel only.
+  coworkSessions: number;
+  coworkTokens: number;
+  coworkCost: number;
+
+  // Claude Enterprise — Analytics API sync (AssistantDailyStat
+  // provider="claude_enterprise"), every product except Claude Code (which
+  // already has its own column). `enterpriseCost` is null until the per-user
+  // cost report has landed for at least one day in the window.
+  enterpriseActiveDays: number;
+  enterpriseMessages: number;
+  enterpriseTokens: number;
+  enterpriseCost: number | null;
+  /** Products with activity in the window: chat, cowork, design, office, … */
+  enterpriseProducts: string[];
+
+  // Cursor — Admin API sync. `cursorCost` is null when no synced day in the
+  // window carried per-user spend (older rows predate that field).
+  cursorRequests: number;
+  cursorTokens: number;
+  cursorLinesAccepted: number;
+  cursorActiveDays: number;
+  cursorCost: number | null;
+
+  // GitHub Copilot — usage metrics sync. Seat-licensed, so there is no per-user
+  // cost column; `copilotInteractions` are explicit prompts, `copilotTokens`
+  // only cover the CLI + Copilot app (IDE features report no tokens), and
+  // `copilotLinesAccepted` are Copilot-produced lines that landed in the editor.
+  copilotInteractions: number;
+  copilotTokens: number;
+  copilotLinesAccepted: number;
+  copilotActiveDays: number;
+
+  // Direct API calls through the governance proxy.
+  proxyRequests: number;
+  proxyTokens: number;
+  proxyCost: number;
+  proxyFlagged: number;
+
+  // Rollups across surfaces.
+  totalCost: number;
+  totalTokens: number;
+  surfaces: PersonSurface[];
+  surfaceCount: number;
+  lastActiveAt: Date | null;
+}
+
+export interface UnattributedUsage {
+  cost: number;
+  tokens: number;
+  bySurface: Record<PersonSurface, { cost: number; tokens: number }>;
+}
+
+export interface PeopleUsageSummary {
+  people: number;
+  totalCost: number;
+  totalTokens: number;
+  avgCostPerPerson: number;
+  unattributedCost: number;
+  bySurface: { surface: PersonSurface; label: string; people: number; cost: number; tokens: number }[];
+}

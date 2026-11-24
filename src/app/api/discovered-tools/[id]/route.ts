@@ -1,0 +1,280 @@
+import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
+import { prisma } from "@/lib/prisma";
+import { withRole } from "@/lib/auth-guard";
+import { createAuditLog } from "@/lib/audit";
+import { classifyDiscoveredTool } from "@/lib/ai-classification";
+import { enforceIdentityBlock, type IdentityEnforcementResult } from "@/lib/identity-enforcement";
+import { describeProxyEnforcement, type ProxyEnforcementResult } from "@/lib/network-enforcement";
+import { dismissedDomainKey } from "@/lib/discovery-merge";
+import { AI_TOOL_CATEGORY_IDS } from "@/lib/ai-tools-registry";
+
+// A regular update may change the status, the category, or both. `category`
+// is validated against the registry's closed set; null clears it.
+const updateDiscoveredToolSchema = z
+  .object({
+    status: z
+      .enum(["DISCOVERED", "UNDER_REVIEW", "REGISTERED", "BLOCKED", "APPROVED"])
+      .optional(),
+    notes: z.string().max(2000).nullish(),
+    category: z.enum(AI_TOOL_CATEGORY_IDS).nullable().optional(),
+    // Why the reviewer made this call (guided triage). Kept in the audit log,
+    // not in `notes`, so it never overwrites observation notes.
+    rationale: z.string().trim().max(2000).optional(),
+    triage: z
+      .object({
+        dataExposure: z.enum(["none", "internal", "customer", "unknown"]).optional(),
+        businessNeed: z.enum(["yes", "no", "unknown"]).optional(),
+        approvedAlternative: z.enum(["yes", "no", "unknown"]).optional(),
+        recommended: z.enum(["register", "approve", "block", "dismiss"]).optional(),
+      })
+      .optional(),
+  })
+  .refine((data) => data.status !== undefined || data.category !== undefined, {
+    message: "status or category is required",
+  });
+
+export async function PUT(
+  req: NextRequest,
+  { params }: { params: Promise<{ id: string }> }
+) {
+  return withRole(["ADMIN", "COMPLIANCE_OFFICER"], async (session) => {
+    const { id } = await params;
+    const body = await req.json();
+
+    // Handle promote low-confidence candidate to main discovery queue
+    if (body.action === "promote") {
+      const tool = await prisma.discoveredAITool.findUnique({ where: { id } });
+      if (!tool) return NextResponse.json({ error: "Not found" }, { status: 404 });
+
+      const updated = await prisma.discoveredAITool.update({
+        where: { id },
+        data: {
+          matchConfidence: "high",
+          notes: tool.notes
+            ? `${tool.notes}\nManually promoted from low-confidence queue.`
+            : "Manually promoted from low-confidence queue.",
+        },
+      });
+
+      await createAuditLog({
+        userId: session.user.userId,
+        action: "PROMOTE",
+        entityType: "DiscoveredAITool",
+        entityId: id,
+        changes: { fromConfidence: tool.matchConfidence, toConfidence: "high" },
+      });
+
+      return NextResponse.json(updated);
+    }
+
+    // Handle dismiss candidate (permanently suppress from future scans)
+    if (body.action === "dismiss_candidate") {
+      const reason = typeof body.reason === "string" && body.reason.trim() ? body.reason.trim() : null;
+      if (!reason) {
+        return NextResponse.json({ error: "reason is required for dismissal" }, { status: 400 });
+      }
+
+      const tool = await prisma.discoveredAITool.findUnique({ where: { id } });
+      if (!tool) return NextResponse.json({ error: "Not found" }, { status: 404 });
+
+      await prisma.$transaction(async (tx) => {
+        // Create DismissedCandidate to prevent resurfacing
+        // Store "" (never NULL) for a domain-less tool: the unique key is
+        // (toolName, detectedDomain) and the scan/ingest lookups query with
+        // dismissedDomainKey(), which maps null -> "". A NULL row would never
+        // be found and the tool would resurface on every scan.
+        const detectedDomain = dismissedDomainKey(tool.detectedDomain);
+        await tx.dismissedCandidate.upsert({
+          where: { toolName_detectedDomain: { toolName: tool.toolName, detectedDomain } },
+          update: { reason, dismissedByUserId: session.user.userId },
+          create: {
+            toolName: tool.toolName,
+            vendor: tool.vendor,
+            detectedDomain,
+            reason,
+            dismissedByUserId: session.user.userId,
+          },
+        });
+        // Remove the discovery record
+        await tx.discoveredAITool.delete({ where: { id } });
+      });
+
+      await createAuditLog({
+        userId: session.user.userId,
+        action: "DISMISS_CANDIDATE",
+        entityType: "DiscoveredAITool",
+        entityId: id,
+        changes: { toolName: tool.toolName, reason },
+      });
+
+      return NextResponse.json({ dismissed: true });
+    }
+
+    // Handle promote to registered system
+    if (body.action === "register" || body.action === "register_and_assess") {
+      const tool = await prisma.discoveredAITool.findUnique({ where: { id } });
+      if (!tool) return NextResponse.json({ error: "Not found" }, { status: 404 });
+
+      // Attempt AI-assisted classification so the new governed system starts
+      // with sensible defaults (use case, model type, data inputs/outputs,
+      // risk level, sensitivity). Best-effort: returns null on failure or
+      // when the AI provider isn't configured; we fall back to plain defaults.
+      const enrichment = await classifyDiscoveredTool({
+        toolName: tool.toolName,
+        vendor: tool.vendor,
+        detectedDomain: tool.detectedDomain,
+        department: tool.department,
+        notes: tool.notes,
+      });
+
+      const fallbackDescription =
+        `Registered from shadow AI discovery. ${tool.notes ?? ""}`.trim();
+
+      const system = await prisma.aISystem.create({
+        data: {
+          name: tool.toolName,
+          description: enrichment?.description ?? fallbackDescription,
+          useCase: enrichment?.useCase ?? null,
+          modelType: enrichment?.modelType ?? null,
+          dataInputs: enrichment?.dataInputs ?? null,
+          dataOutputs: enrichment?.dataOutputs ?? null,
+          department: tool.department ?? "Unknown",
+          vendor: tool.vendor,
+          ownerId: session.user.userId,
+          status: "UNDER_REVIEW",
+          riskLevel: enrichment?.riskLevel ?? "MEDIUM",
+          dataSensitivity: enrichment?.dataSensitivity ?? "INTERNAL",
+        },
+      });
+
+      await prisma.discoveredAITool.update({
+        where: { id },
+        data: { status: "REGISTERED", linkedSystemId: system.id },
+      });
+
+      await createAuditLog({
+        userId: session.user.userId,
+        action: "REGISTER",
+        entityType: "DiscoveredAITool",
+        entityId: id,
+        aiSystemId: system.id,
+        changes: enrichment
+          ? {
+              aiAssisted: true,
+              inferredFields: Object.keys(enrichment).filter((k) => k !== "reasoning"),
+              reasoning: enrichment.reasoning ?? null,
+            }
+          : { aiAssisted: false },
+      });
+
+      return NextResponse.json({
+        system,
+        tool: { id, status: "REGISTERED", linkedSystemId: system.id },
+        aiAssisted: !!enrichment,
+        nextHref:
+          body.action === "register_and_assess"
+            ? `/risk-center/assessments/new?systemId=${system.id}`
+            : `/registry/${system.id}`,
+      });
+    }
+
+    // Regular status update
+    const parsed = updateDiscoveredToolSchema.safeParse(body);
+    if (!parsed.success) {
+      return NextResponse.json(
+        { error: "Validation failed", details: parsed.error.flatten() },
+        { status: 400 }
+      );
+    }
+
+    const existing = await prisma.discoveredAITool.findUnique({ where: { id } });
+    if (!existing) return NextResponse.json({ error: "Not found" }, { status: 404 });
+
+    const nextStatus = parsed.data.status ?? existing.status;
+    const categoryChanged =
+      parsed.data.category !== undefined && parsed.data.category !== existing.category;
+
+    const updated = await prisma.discoveredAITool.update({
+      where: { id },
+      data: {
+        status: nextStatus,
+        ...(parsed.data.notes !== undefined ? { notes: parsed.data.notes } : {}),
+        ...(categoryChanged ? { category: parsed.data.category } : {}),
+      },
+    });
+
+    if (categoryChanged) {
+      await createAuditLog({
+        userId: session.user.userId,
+        action: "UPDATE_CATEGORY",
+        entityType: "DiscoveredAITool",
+        entityId: id,
+        changes: { from: existing.category, to: parsed.data.category ?? null },
+      });
+    }
+
+    // Identity-layer enforcement: when a tool enters BLOCKED, disable its IdP
+    // sign-ins; when it leaves BLOCKED, restore them. Best-effort — a failure
+    // here is reported, not fatal, so the status change still persists.
+    let identityEnforcement: IdentityEnforcementResult | undefined;
+    // In-path enforcement needs no call — the network proxy denies every
+    // BLOCKED domain — but the outcome depends on its mode, so report it.
+    let proxyEnforcement: ProxyEnforcementResult | undefined;
+    const enteringBlocked =
+      nextStatus === "BLOCKED" && existing.status !== "BLOCKED";
+    const leavingBlocked =
+      existing.status === "BLOCKED" && nextStatus !== "BLOCKED";
+    if (enteringBlocked || leavingBlocked) {
+      identityEnforcement = await enforceIdentityBlock(
+        {
+          toolName: existing.toolName,
+          externalAppId: existing.externalAppId,
+          externalAppProvider: existing.externalAppProvider,
+        },
+        enteringBlocked
+      );
+      proxyEnforcement = await describeProxyEnforcement(
+        { toolName: existing.toolName, detectedDomain: existing.detectedDomain },
+        enteringBlocked
+      );
+    }
+
+    if (existing.status !== nextStatus) {
+      const action = existing.status === "BLOCKED" ? "UNBLOCK" : "UPDATE_STATUS";
+      await createAuditLog({
+        userId: session.user.userId,
+        action,
+        entityType: "DiscoveredAITool",
+        entityId: id,
+        changes: {
+          from: existing.status,
+          to: nextStatus,
+          ...(parsed.data.rationale ? { rationale: parsed.data.rationale } : {}),
+          ...(parsed.data.triage ? { triage: parsed.data.triage } : {}),
+          ...(identityEnforcement
+            ? {
+                identityEnforcement: {
+                  provider: identityEnforcement.provider,
+                  action: identityEnforcement.action,
+                  enforced: identityEnforcement.enforced,
+                },
+              }
+            : {}),
+          ...(proxyEnforcement
+            ? {
+                proxyEnforcement: {
+                  mode: proxyEnforcement.mode,
+                  action: proxyEnforcement.action,
+                  enforced: proxyEnforcement.enforced,
+                  domain: proxyEnforcement.domain,
+                },
+              }
+            : {}),
+        },
+      });
+    }
+
+    return NextResponse.json({ ...updated, identityEnforcement, proxyEnforcement });
+  });
+}

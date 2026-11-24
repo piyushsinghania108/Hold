@@ -1,0 +1,533 @@
+import { google } from "googleapis";
+import { JWT } from "google-auth-library";
+import {
+  matchDomain,
+  resolveAIToolMatch,
+  type AIToolMatchResult,
+} from "./ai-tools-registry";
+import { getSetting, GOOGLE_SETTINGS_KEYS } from "./settings";
+
+export interface ScanDiscovery {
+  toolName: string;
+  vendor: string;
+  domain: string;
+  /** Distinct user identities observed by this scan (empty when the source has no identity). */
+  userEmails: string[];
+  userCount: number;
+  /** OAuth scopes granted to the app (identity-provider sources only). */
+  scopes?: string[];
+  /** Earliest / latest observation in this scan. Omit when the source has no timestamps. */
+  firstSeenAt?: Date;
+  lastSeenAt?: Date;
+  notes?: string;
+  matchConfidence?: "high" | "medium" | "low";
+  matchScore?: number;
+  matchReasons?: string[];
+  // Identity-provider app handle for identity-layer enforcement (optional —
+  // only set when the scan source exposes it).
+  externalAppId?: string;
+  externalAppProvider?: "google_workspace" | "microsoft_365";
+}
+
+export interface FullScanResult {
+  discoveries: ScanDiscovery[];
+  totalEventsScanned: number;
+  aiToolsFound: number;
+}
+
+type MatchConfidence = "high" | "medium" | "low";
+
+/**
+ * Check if Google Workspace scanning is configured.
+ * Checks DB settings first, then env vars.
+ */
+export async function isGoogleWorkspaceConfigured(): Promise<boolean> {
+  const serviceKey =
+    (await getSetting(GOOGLE_SETTINGS_KEYS.SERVICE_ACCOUNT_KEY)) ??
+    process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  const adminEmail =
+    (await getSetting(GOOGLE_SETTINGS_KEYS.ADMIN_EMAIL)) ??
+    process.env.GOOGLE_ADMIN_EMAIL;
+  return !!(serviceKey && adminEmail);
+}
+
+const SHADOW_AI_SCOPES = [
+  "https://www.googleapis.com/auth/admin.reports.audit.readonly",
+  "https://www.googleapis.com/auth/admin.directory.user.security",
+];
+
+/**
+ * Create a JWT auth client for Google Admin SDK.
+ * Reads credentials from DB settings, falling back to env vars.
+ */
+async function getAuthClient(): Promise<JWT> {
+  return createGoogleAdminAuthClient(SHADOW_AI_SCOPES);
+}
+
+/**
+ * Build a domain-wide-delegation JWT client for the configured service
+ * account, impersonating the configured admin, with an explicit scope list.
+ * Every scope requested here must also be authorised for the service
+ * account's client ID under Admin console → Security → API controls →
+ * Domain-wide delegation, or Google rejects the token request. Callers that
+ * need a scope the shadow-AI scan does not (e.g. the directory sync's
+ * `admin.directory.user.readonly`) pass their own list so the scan keeps
+ * working on tenants that never granted the extra scope.
+ */
+export async function createGoogleAdminAuthClient(scopes: string[]): Promise<JWT> {
+  const keyData =
+    (await getSetting(GOOGLE_SETTINGS_KEYS.SERVICE_ACCOUNT_KEY)) ??
+    process.env.GOOGLE_SERVICE_ACCOUNT_KEY;
+  const adminEmail =
+    (await getSetting(GOOGLE_SETTINGS_KEYS.ADMIN_EMAIL)) ??
+    process.env.GOOGLE_ADMIN_EMAIL;
+
+  if (!keyData || !adminEmail) {
+    throw new Error("Google Workspace not configured");
+  }
+
+  let key: { client_email: string; private_key: string };
+
+  try {
+    if (keyData.startsWith("{")) {
+      key = JSON.parse(keyData);
+    } else {
+      key = JSON.parse(Buffer.from(keyData, "base64").toString("utf-8"));
+    }
+  } catch {
+    throw new Error("Invalid service account key format");
+  }
+
+  return new JWT({
+    email: key.client_email,
+    key: key.private_key,
+    scopes,
+    subject: adminEmail,
+  });
+}
+
+/**
+ * Scan OAuth token authorization events from the Reports API.
+ * This discovers AI tools that users have authorized via "Sign in with Google".
+ * Optimized for speed: limits pages, filters early, short timeout.
+ */
+export async function scanTokenActivity(
+  lookbackDays: number = 30
+): Promise<{ events: TokenEvent[]; totalScanned: number }> {
+  const auth = await getAuthClient();
+  const service = google.admin({ version: "reports_v1", auth });
+
+  const startTime = new Date();
+  startTime.setDate(startTime.getDate() - lookbackDays);
+
+  const events: TokenEvent[] = [];
+  let pageToken: string | undefined;
+  let totalScanned = 0;
+  let pageCount = 0;
+  const maxPages = 5; // Limit pagination to stay within serverless timeout
+
+  do {
+    const response = await service.activities.list({
+      userKey: "all",
+      applicationName: "token",
+      startTime: startTime.toISOString(),
+      maxResults: 500,
+      pageToken,
+    });
+
+    const items = response.data.items ?? [];
+    totalScanned += items.length;
+    pageCount++;
+
+    for (const item of items) {
+      const params = item.events?.[0]?.parameters ?? [];
+      const eventName = item.events?.[0]?.name ?? "unknown";
+      const clientId = params.find((p) => p.name === "client_id")?.value ?? "";
+      const appName =
+        params.find((p) => p.name === "app_name")?.value ??
+        clientId ??
+        "";
+      const scopes = params
+        .find((p) => p.name === "scope")
+        ?.multiValue ?? [];
+
+      const candidateDomains = extractDomainsFromGoogleSignal(appName, scopes);
+      const resolvedMatch =
+        resolveAIToolMatch({
+          clientName: appName,
+          scopes,
+          domains: candidateDomains,
+          additionalText: [eventName],
+        }) ??
+        candidateDomains
+          .map((domain) => {
+            const tool = matchDomain(domain);
+            return tool
+              ? {
+                  tool,
+                  confidence: "medium" as const,
+                  score: 7,
+                  reasons: [`domain matched "${domain}"`],
+                }
+              : null;
+          })
+          .find(Boolean) ??
+        null;
+
+      const candidate =
+        resolvedMatch ??
+        (isLikelyAICandidate(appName, scopes, candidateDomains)
+          ? buildLowConfidenceCandidate(appName, candidateDomains, scopes)
+          : null);
+
+      if (candidate) {
+        events.push({
+          appName,
+          clientId,
+          scopes,
+          userEmail: item.actor?.email ?? "unknown",
+          timestamp: item.id?.time ?? new Date().toISOString(),
+          eventName,
+          match: candidate,
+          candidateDomains,
+        });
+      }
+    }
+
+    pageToken = response.data.nextPageToken ?? undefined;
+  } while (pageToken && pageCount < maxPages);
+
+  return { events, totalScanned };
+}
+
+interface TokenEvent {
+  appName: string;
+  clientId: string;
+  scopes: string[];
+  userEmail: string;
+  timestamp: string;
+  eventName: string;
+  match: AIToolMatchResult;
+  candidateDomains: string[];
+}
+
+/**
+ * List all OAuth tokens for a specific user via the Directory API.
+ */
+export async function scanUserTokens(
+  userEmail: string
+): Promise<{ toolName: string; vendor: string; domain: string }[]> {
+  const auth = await getAuthClient();
+  const service = google.admin({ version: "directory_v1", auth });
+
+  const response = await service.tokens.list({ userKey: userEmail });
+  const tokens = response.data.items ?? [];
+  const results: { toolName: string; vendor: string; domain: string }[] = [];
+
+  for (const token of tokens) {
+    const displayText = token.displayText ?? "";
+    const scopes = token.scopes ?? [];
+    const candidateDomains = extractDomainsFromGoogleSignal(displayText, scopes);
+    const match =
+      resolveAIToolMatch({
+        clientName: displayText,
+        scopes,
+        domains: candidateDomains,
+      })?.tool ?? null;
+
+    if (match) {
+      results.push({
+        toolName: match.toolName,
+        vendor: match.vendor,
+        domain: match.domains[0],
+      });
+    }
+  }
+
+  return results;
+}
+
+export interface GoogleRevocationResult {
+  usersTargeted: number;
+  tokensRevoked: number;
+  errors: number;
+  capped: boolean;
+}
+
+/**
+ * Revoke an OAuth app's access across the domain by deleting each authorizing
+ * user's token grant for the given client_id. This invalidates the app's
+ * refresh tokens, cutting off its access to Google data.
+ *
+ * Uses only already-granted scopes — `admin.reports.audit.readonly` to find
+ * which users authorized the app (from the token audit log), and
+ * `admin.directory.user.security` to delete each grant. No re-consent needed.
+ *
+ * Caveats (surfaced to the admin by the caller):
+ *  - Google exposes no per-app *block* API, so users can re-authorize later.
+ *    Preventing re-consent requires the org-wide "Block all unconfigured apps"
+ *    policy (Admin console / Cloud Identity, applied globally).
+ *  - Only users seen in the audit lookback window are targeted.
+ *  - Revocations are capped per call to stay within the request timeout.
+ */
+export async function revokeGoogleAppAccess(
+  clientId: string,
+  options: { lookbackDays?: number; maxUsers?: number } = {}
+): Promise<GoogleRevocationResult> {
+  const { lookbackDays = 90, maxUsers = 50 } = options;
+  const auth = await getAuthClient();
+  const reports = google.admin({ version: "reports_v1", auth });
+  const directory = google.admin({ version: "directory_v1", auth });
+
+  // 1. Find users who authorized this client_id via the token audit log.
+  const userEmails = new Set<string>();
+  const startTime = new Date();
+  startTime.setDate(startTime.getDate() - lookbackDays);
+  let pageToken: string | undefined;
+  let pageCount = 0;
+  const maxPages = 10;
+
+  do {
+    const response = await reports.activities.list({
+      userKey: "all",
+      applicationName: "token",
+      eventName: "authorize",
+      filters: `client_id==${clientId}`,
+      startTime: startTime.toISOString(),
+      maxResults: 500,
+      pageToken,
+    });
+    for (const item of response.data.items ?? []) {
+      const email = item.actor?.email;
+      if (email) userEmails.add(email);
+    }
+    pageToken = response.data.nextPageToken ?? undefined;
+    pageCount++;
+  } while (pageToken && pageCount < maxPages);
+
+  // 2. Revoke the grant for each user, capped to bound request duration.
+  const targets = Array.from(userEmails);
+  const capped = targets.length > maxUsers;
+  const batch = targets.slice(0, maxUsers);
+  let tokensRevoked = 0;
+  let errors = 0;
+
+  for (const userEmail of batch) {
+    try {
+      await directory.tokens.delete({ userKey: userEmail, clientId });
+      tokensRevoked++;
+    } catch (err) {
+      // 404 = the user no longer has this grant; treat as already-revoked.
+      const code = (err as { code?: number; status?: number }).code;
+      if (code === 404) continue;
+      errors++;
+    }
+  }
+
+  return { usersTargeted: targets.length, tokensRevoked, errors, capped };
+}
+
+/**
+ * Run a full scan: scan token activity events and aggregate discoveries.
+ */
+export async function runFullScan(
+  lookbackDays: number = 30
+): Promise<FullScanResult> {
+  const { events, totalScanned } = await scanTokenActivity(lookbackDays);
+
+  const discoveryMap = new Map<
+    string,
+    ScanDiscovery & {
+      firstSeen: string;
+      lastSeen: string;
+      scopeSet: Set<string>;
+      eventCount: number;
+      activeDays: Set<string>;
+      confidence: MatchConfidence;
+      reasons: string[];
+      lowConfidenceCandidate: boolean;
+    }
+  >();
+
+  for (const event of events) {
+    const match = event.match;
+    const domain =
+      event.candidateDomains[0] ?? match.tool.domains[0] ?? "unknown";
+    const key = `${match.tool.toolName}::${domain}`;
+    const existing = discoveryMap.get(key);
+    const eventDay = new Date(event.timestamp).toISOString().slice(0, 10);
+
+    if (existing) {
+      if (!existing.userEmails.includes(event.userEmail)) {
+        existing.userEmails.push(event.userEmail);
+        existing.userCount = existing.userEmails.length;
+      }
+      existing.lastSeen =
+        new Date(event.timestamp).getTime() > new Date(existing.lastSeen).getTime()
+          ? event.timestamp
+          : existing.lastSeen;
+      existing.firstSeen =
+        new Date(event.timestamp).getTime() < new Date(existing.firstSeen).getTime()
+          ? event.timestamp
+          : existing.firstSeen;
+      existing.eventCount += 1;
+      existing.activeDays.add(eventDay);
+      for (const scope of event.scopes) existing.scopeSet.add(scope);
+      existing.confidence =
+        confidenceRank(match.confidence) > confidenceRank(existing.confidence)
+          ? match.confidence
+          : existing.confidence;
+      existing.reasons = Array.from(new Set([...existing.reasons, ...match.reasons]));
+      // Backfill the OAuth client_id if an earlier event for this app lacked it.
+      if (!existing.externalAppId && event.clientId) {
+        existing.externalAppId = event.clientId;
+        existing.externalAppProvider = "google_workspace";
+      }
+    } else {
+      discoveryMap.set(key, {
+        toolName: match.tool.toolName,
+        vendor: match.tool.vendor,
+        domain,
+        externalAppId: event.clientId || undefined,
+        externalAppProvider: event.clientId ? "google_workspace" : undefined,
+        userEmails: [event.userEmail],
+        userCount: 1,
+        firstSeen: event.timestamp,
+        lastSeen: event.timestamp,
+        scopeSet: new Set(event.scopes),
+        eventCount: 1,
+        activeDays: new Set([eventDay]),
+        confidence: match.confidence,
+        reasons: match.reasons,
+        lowConfidenceCandidate: match.confidence === "low",
+      });
+    }
+  }
+
+  const discoveries = Array.from(discoveryMap.values()).map((discovery) => ({
+    toolName: discovery.toolName,
+    vendor: discovery.vendor,
+    domain: discovery.domain,
+    externalAppId: discovery.externalAppId,
+    externalAppProvider: discovery.externalAppProvider,
+    userEmails: discovery.userEmails,
+    userCount: discovery.userCount,
+    scopes: Array.from(discovery.scopeSet),
+    firstSeenAt: toValidDate(discovery.firstSeen),
+    lastSeenAt: toValidDate(discovery.lastSeen),
+    matchConfidence: discovery.confidence,
+    matchScore: discovery.confidence === "high" ? 12 : discovery.confidence === "medium" ? 7 : 3,
+    matchReasons: discovery.reasons,
+    notes: buildGoogleDiscoveryNotes({
+      confidence: discovery.confidence,
+      reasons: discovery.reasons,
+      eventCount: discovery.eventCount,
+      activeDays: discovery.activeDays.size,
+      lowConfidenceCandidate: discovery.lowConfidenceCandidate,
+    }),
+  }));
+
+  return {
+    discoveries,
+    totalEventsScanned: totalScanned,
+    aiToolsFound: discoveries.length,
+  };
+}
+
+function extractDomainsFromGoogleSignal(
+  appName: string,
+  scopes: string[]
+): string[] {
+  const domains = new Set<string>();
+  const text = [appName, ...scopes].join(" ");
+  const domainPattern = /\b([a-z0-9-]+\.)+[a-z]{2,}\b/gi;
+
+  for (const match of text.matchAll(domainPattern)) {
+    const candidate = match[0]?.toLowerCase().replace(/^www\./, "");
+    if (
+      candidate &&
+      candidate !== "googleapis.com" &&
+      !candidate.endsWith(".googleapis.com")
+    ) {
+      domains.add(candidate);
+    }
+  }
+
+  return Array.from(domains);
+}
+
+function isLikelyAICandidate(
+  appName: string,
+  scopes: string[],
+  domains: string[]
+) {
+  const combined = [appName, ...scopes, ...domains].join(" ").toLowerCase();
+  const aiKeywords = [
+    "ai",
+    "gpt",
+    "copilot",
+    "claude",
+    "gemini",
+    "llm",
+    "anthropic",
+    "openai",
+    "mistral",
+    "perplexity",
+    "cursor",
+  ];
+
+  if (domains.some((domain) => domain.endsWith(".ai"))) return true;
+  return aiKeywords.some((keyword) => combined.includes(keyword));
+}
+
+function buildLowConfidenceCandidate(
+  appName: string,
+  domains: string[],
+  scopes: string[]
+): AIToolMatchResult {
+  const normalizedName = appName.trim() || domains[0] || "Unclassified AI App";
+  const domain = domains[0] ?? "unknown.ai";
+  return {
+    tool: {
+      toolName: normalizedName,
+      vendor: "Needs Review",
+      category: "other",
+      domains: [domain],
+      clientNamePatterns: [normalizedName.toLowerCase()],
+    },
+    confidence: "low",
+    score: 3,
+    reasons: [
+      `heuristic AI signal from ${domains.some((item) => item.endsWith(".ai")) ? ".ai domain" : "app/scopes keywords"}`,
+      scopes.length > 0 ? "OAuth scopes present" : "raw app name only",
+    ],
+  };
+}
+
+function confidenceRank(value: MatchConfidence) {
+  return value === "high" ? 3 : value === "medium" ? 2 : 1;
+}
+
+function toValidDate(value: string): Date | undefined {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? undefined : date;
+}
+
+// First/last seen, scopes and user emails are persisted as structured columns
+// on DiscoveredAITool (see scan-executor.ts), so the note stays a short
+// human-readable summary of the match itself.
+function buildGoogleDiscoveryNotes(input: {
+  confidence: MatchConfidence;
+  reasons: string[];
+  eventCount: number;
+  activeDays: number;
+  lowConfidenceCandidate: boolean;
+}) {
+  return [
+    input.lowConfidenceCandidate
+      ? "Low-confidence Google OAuth candidate."
+      : `Matched with ${input.confidence} confidence.`,
+    `Signals: ${input.reasons.join(", ")}.`,
+    `Observed ${input.eventCount} token event(s) across ${input.activeDays} day(s).`,
+  ].join(" ");
+}

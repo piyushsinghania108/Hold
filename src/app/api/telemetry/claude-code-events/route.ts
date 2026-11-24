@@ -1,0 +1,170 @@
+import { NextRequest, NextResponse } from "next/server";
+import { Prisma } from "@prisma/client";
+import { prisma } from "@/lib/prisma";
+import { getSetting } from "@/lib/settings";
+import {
+  flattenOtlpLogs,
+  otlpLogsPayloadSchema,
+} from "@/lib/validations/claude-code-telemetry";
+import { analyzePromptRisk, createPromptRiskAlert } from "@/lib/prompt-risk";
+import { recordClaudeCodeExtensions, selectUnseenClaudeCodeRows } from "@/lib/assistant-extensions";
+
+// Events are higher-volume than metrics; the Collector's batch processor is
+// capped at 1000 records per flush which fits comfortably under the row
+// ceiling below.
+export const maxDuration = 60;
+
+// Ceiling on flattened rows per request, to protect the DB from a runaway or
+// hostile batch. Override with TELEMETRY_MAX_ROWS.
+const MAX_ROWS = Number(process.env.TELEMETRY_MAX_ROWS) || 5000;
+
+// Same bearer secret as the metrics endpoint — the Collector presents one
+// token for both signals. Falls back to the env var when the AppSetting is
+// unset, mirroring /api/telemetry/claude-code.
+async function authorize(req: NextRequest): Promise<boolean> {
+  const header = req.headers.get("authorization") ?? "";
+  const match = header.match(/^Bearer\s+(.+)$/i);
+  if (!match) return false;
+  const token = match[1];
+  const expected =
+    (await getSetting("claude_code_telemetry_secret")) ??
+    process.env.CLAUDE_CODE_TELEMETRY_SECRET;
+  if (!expected) return false;
+  // Constant-time compare
+  if (token.length !== expected.length) return false;
+  let diff = 0;
+  for (let i = 0; i < token.length; i++) {
+    diff |= token.charCodeAt(i) ^ expected.charCodeAt(i);
+  }
+  return diff === 0;
+}
+
+export async function POST(req: NextRequest) {
+  if (!(await authorize(req))) {
+    return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  }
+
+  let raw: unknown;
+  try {
+    raw = await req.json();
+  } catch {
+    return NextResponse.json({ error: "Invalid JSON" }, { status: 400 });
+  }
+
+  const parsed = otlpLogsPayloadSchema.safeParse(raw);
+  if (!parsed.success) {
+    return NextResponse.json(
+      { error: "Invalid OTLP logs payload" },
+      { status: 400 },
+    );
+  }
+
+  // flattenOtlpLogs drops records without an event.name, strips sensitive
+  // content keys from the stored attribute bag, and surfaces user_prompt
+  // text on the transient `promptText` field for risk analysis only.
+  const rows = flattenOtlpLogs(parsed.data);
+  if (rows.length === 0) {
+    return NextResponse.json(
+      { accepted: 0, duplicates: 0, flagged: 0 },
+      { status: 202 },
+    );
+  }
+  if (rows.length > MAX_ROWS) {
+    console.warn(
+      `[telemetry/claude-code-events] rejected batch of ${rows.length} rows (ceiling ${MAX_ROWS})`,
+    );
+    return NextResponse.json(
+      { error: "Payload too large", rows: rows.length, max: MAX_ROWS },
+      { status: 413 },
+    );
+  }
+
+  // ── Dangerous-prompt detection (Option A: analyze in-memory, persist
+  //    only the verdict). The raw prompt is never written to the DB — we
+  //    read promptText here, run the same rule engine the proxy uses, store
+  //    severity/category on the event row, and raise an alert on a match
+  //    (the alert keeps only a sanitized excerpt). promptText is discarded.
+  let flaggedCount = 0;
+  const analyses = await Promise.all(
+    rows.map((r) =>
+      r.eventName === "user_prompt" && r.promptText
+        ? analyzePromptRisk({ prompt: r.promptText })
+        : Promise.resolve(null),
+    ),
+  );
+  for (let i = 0; i < rows.length; i++) {
+    const analysis = analyses[i];
+    if (!analysis) continue;
+    // Salted fingerprint of the prompt (never the prompt) — joins this event
+    // to proxy usage rows and alerts that carried the same prompt. The
+    // `prompt` content key itself stays stripped from the bag.
+    if (analysis.promptHash) {
+      rows[i].attributes["prompt.hash"] = analysis.promptHash;
+    }
+    if (!analysis.flagged) continue;
+    flaggedCount++;
+    rows[i].riskSeverity = analysis.severity;
+    rows[i].riskCategory =
+      analysis.categories.join(", ") || analysis.ruleKeys.join(", ") || null;
+    // Sequential to avoid racing the alert-dedup window.
+    await createPromptRiskAlert({
+      provider: "claude_code",
+      surface: "claude_code",
+      model: rows[i].model ?? "claude-code",
+      department: null,
+      userEmail: rows[i].userEmail,
+      analysis,
+    });
+  }
+
+  // Extension-bearing rows not yet stored — resolved before the insert so a
+  // re-sent batch cannot be counted into the inventory twice.
+  const inventoryRows = await selectUnseenClaudeCodeRows(rows);
+
+  // `dedupeKey` (unique) + skipDuplicates make collector retries idempotent;
+  // `count` is the number actually inserted.
+  const { count } = await prisma.claudeCodeEvent.createMany({
+    skipDuplicates: true,
+    data: rows.map((r) => ({
+      dedupeKey: r.dedupeKey,
+      timestamp: r.timestamp,
+      sessionId: r.sessionId,
+      promptId: r.promptId,
+      eventSequence: r.eventSequence,
+      userId: r.userId,
+      userEmail: r.userEmail,
+      organizationId: r.organizationId,
+      accountUuid: r.accountUuid,
+      appVersion: r.appVersion,
+      terminalType: r.terminalType,
+      eventName: r.eventName,
+      toolName: r.toolName,
+      decision: r.decision,
+      decisionSource: r.decisionSource,
+      success: r.success,
+      durationMs: r.durationMs,
+      model: r.model,
+      statusCode: r.statusCode,
+      errorType: r.errorType,
+      entrypoint: r.entrypoint,
+      riskSeverity: r.riskSeverity,
+      riskCategory: r.riskCategory,
+      // NOTE: r.promptText is intentionally NOT persisted.
+      attributes: r.attributes as Prisma.InputJsonValue,
+    })),
+  });
+
+  // Extension inventory (plugins, MCP servers, skills, hooks, subagents) —
+  // identifiers only, merged into AssistantExtension. Never fails the request.
+  const inventory = await recordClaudeCodeExtensions(inventoryRows);
+
+  return NextResponse.json(
+    {
+      accepted: count,
+      duplicates: rows.length - count,
+      flagged: flaggedCount,
+      extensions: inventory?.rows ?? 0,
+    },
+    { status: 202 },
+  );
+}
