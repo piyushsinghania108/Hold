@@ -22,7 +22,7 @@
 3. [Who It's For](#who-its-for)
 4. [Why Now](#why-now)
 5. [The Problem-Solution Matrix](#the-problem-solution-matrix)
-6. [Three Pillars](#three-pillars)
+6. [Seven Pillars](#Seven-pillars)
 7. [Architecture Overview](#architecture-overview)
 8. [Module Reference](#module-reference)
 9. [Integration Reference](#integration-reference)
@@ -146,29 +146,64 @@ Compliance Officers · CISOs · VP Risk · General Counsel · CIO
 
 ---
 
-## Three Pillars
+---
 
-### Pillar 1: Sovereign AI Governance
-*Your AI estate. Your infrastructure. Your rules.*
+## The 7-Pillar AI Governance Framework
 
-- **Self-hosted** — Deploy to your Vercel + Azure + PostgreSQL. Data never leaves your boundary.
-- **Regulatory alignment** — EU AI Act wizard (Art. 5/6/27/50, Annex I/III, GPAI/FRIA) + 96 seeded controls across NIST AI RMF, ISO 42001, EU AI Act, SOC 2 with 107 crosswalk links.
-- **Policy-as-code** — Machine-readable rules with evidence, exceptions, and audit trails.
-- **No vendor lock-in** — MIT licensed, standard stack, portable anywhere.
-- **Provider-agnostic AI** — Use Anthropic, OpenAI, or both for risk classification, gap analysis, and agent reviews. Your governance brain is not captive to one AI vendor.
+Hold is architected to operationalize the complete 7-pillar AI Governance Framework. While Hold provides deep runtime enforcement and automation for the technical pillars, it also provides the structured registry, evidence, and workflow capabilities required to satisfy organizational and ethical governance requirements.
 
-### Pillar 2: Runtime Security
-*Policy enforced in the request path — not in a dashboard.*
+### 🏛️ 01. Policy
+*Set the rules for how AI is built, bought, and used at work.*
+Hold translates static policies into runtime enforcement.
+*   **Core Controls:** Acceptable use policy, Approved AI tools, Data usage rules, Shadow AI controls, Vendor AI policy.
+*   **Operational Rules:** Prompt & output rules, IP & copyright rules, Disclosure rules, Exception process, Policy reviews.
+*   **Hold's Implementation:** Policy-as-code with off/dry-run/enforce modes, inline DLP, and automated shadow AI blocklists.
 
-- **Transparent AI Proxy** — Anthropic, OpenAI, Azure OpenAI, Gemini, Bedrock + general HTTPS with off/dry-run/enforce modes.
-- **Proxy-enforced kill switch** — Immediate 403 on suspended agents.
-- **Inline DLP** — Secrets, PII, system prompts, exfiltration detection on live traffic.
-- **Dangerous-prompt detection** — 5 built-in rules + custom, ReDoS-validated, 50ms probe.
-- **Shadow AI enforcement** — Three layers: in-path proxy, blocklist feed, IdP app-disable.
-- **Advisory vs. blocking semantics** — Roll out enforcement gradually with dry-run mode.
+### ⚠️ 02. Risk Assessment
+*Identify, score, and treat AI risks before and after deployment.*
+Hold provides a centralized Risk Center for continuous assessment.
+*   **Risk Identification & Scoring:** Risk tiering, Impact assessment, Threat modeling, Use-case scoring.
+*   **Specific Risk Vectors:** Bias risk, Privacy risk, Security risk, Vendor risk.
+*   **Ongoing Tracking:** Residual risk, Risk register.
+*   **Hold's Implementation:** 6-dimension scoring, interactive heat maps, agent-aware risk overlays, and the EU AI Act classification wizard.
 
-### Pillar 3: Agent Control Infrastructure
-*Autonomous agents, governed from charter to retirement.*
+### 🗂️ 03. Model Inventory
+*Track every model, agent, and AI system running in the enterprise.*
+Hold acts as the single source of truth for your AI estate.
+*   **Asset Tracking:** Model registry, Model cards, Ownership mapping, Version tracking, Data lineage.
+*   **Ecosystem & Lifecycle:** Agent catalog, Third-party models, Deployment status, Dependency mapping, Retirement tracking.
+*   **Hold's Implementation:** Central Registry module, Agent lifecycle management (charter to retirement), and Shadow AI discovery across 6+ sources.
+
+### ⚖️ 04. Compliance
+*Map AI systems to laws, standards, and internal obligations.*
+Hold automates the mapping of systems to regulatory frameworks.
+*   **Frameworks & Regulations:** EU AI Act, NIST AI RMF, ISO/IEC 42001, GDPR, DPDP Act (India).
+*   **Operational Obligations:** Sector regulations, Data residency, Consent management, Record keeping, Regulatory reporting.
+*   **Hold's Implementation:** 96 seeded controls, 107 crosswalk links, per-system assessment, and continuous compliance posture tracking.
+
+### 🤝 05. Ethics & Responsible AI
+*Keep AI decisions fair, transparent, and aligned with human values.*
+Hold provides the technical guardrails to enforce ethical boundaries.
+*   **The Cycle:** Fairness testing ➔ Bias mitigation ➔ Explainability ➔ Transparency notices ➔ Human oversight.
+*   **Governance Loop:** Ethics review board ➔ Harm assessment ➔ Inclusive design ➔ Stakeholder input ➔ Consent & privacy.
+*   **Hold's Implementation:** Dangerous-prompt detection (jailbreaks, unsafe autonomy), human-review queues for agent tool calls, and PII redaction.
+
+### 👤 06. Accountability
+*Assign clear ownership for every AI decision and outcome.*
+Hold enforces accountability through workflow and access controls.
+*   **Structure & Roles:** AI council, Executive sponsor, Model owners, RACI mapping.
+*   **Processes & Oversight:** Approval gates, Sign-off workflows, Escalation paths, Incident ownership.
+*   **Documentation:** Decision logs, Governance KPIs.
+*   **Hold's Implementation:** Staged approvals (Owner → Security → Legal → Compliance), strict RBAC (Admin/Officer/Viewer), and full audit trails on all mutations.
+
+### 🔍 07. Audit & Assurance
+*Prove AI systems work as intended with evidence and independent review.*
+Hold is built to be "audit-ready" out of the box.
+*   **Continuous Monitoring:** Audit trails, Access reviews, Prompt logs, Output sampling, Control testing, Evidence collection.
+*   **Formal Reviews:** Model audits, Bias audits, Third-party audits, Audit reports.
+*   **Hold's Implementation:** Immutable `AuditLog` table, evidence artifacts, denials log exports, and a custom reporting suite with PDF/CSV/JSON export capabilities.
+
+---
 
 - **Full lifecycle** — Charter → approve → run → review → retire.
 - **MCP governance** — Per-agent server/tool allowlists (monitor + enforce modes).
